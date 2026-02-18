@@ -65,11 +65,11 @@ window.OpenAccessibleConfig = {
 
 | Action | Windows | Mac |
 |--------|---------|-----|
-| Open or close panel | **Alt+A** | **<kbd>Option</kbd> + <kbd>S</kbd>**|
-| Close panel or overlay | **Escape** | **Escape** |
-| Read page (in panel) | **R** | **R** |
-| Stop reading (in panel) | **S** | **S** |
-| Move focus in panel | **Tab** / **Shift+Tab** | **Tab** / **Shift+Tab** |
+| Open or close panel | **Alt+A** | **<kbd>⌥ Option</kbd> + <kbd>S</kbd>**|
+| Close panel or overlay | **Escape** | **<kbd>⎋ Escape</kbd>** |
+| Read page (in panel) | **R** | **<kbd>R</kbd>** |
+| Stop reading (in panel) | **S** | **<kbd>S</kbd>** |
+| Move focus in panel | **Tab** / **Shift+Tab** | **<kbd>⇥ Tab</kbd>** / **<kbd>⇧ Shift</kbd> + <kbd>⇥ Tab</kbd>** |
 
 ---
 
