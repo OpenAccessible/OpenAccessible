@@ -2,20 +2,34 @@
  * OpenAccessible - SAAS-Ready Accessibility Widget
  * Single-file embeddable widget: Color, Dyslexia/Dictionary, Contrast, Language,
  * Size, Cursor, Highlight, TTS, Text Align, Screen Reader/Braille support & more.
- * @license GPU v3
+ * @license AGPL-3.0
+ * @version 1.0.0
  *
  * Structure:
- * - defaultState / state: user preferences (persisted to localStorage)
+ * - defaultState / state: user preferences (persisted to localStorage unless guestMode)
  * - API: optional backend (apiBase) for dictionary, TTS, translate, preferences
+ * - translateApiUrl: optional LibreTranslate-style endpoint (default OSS Translate); fallback apiBase then MyMemory
  * - Panel: settings UI; toolbar: floating button + position
  * - Dictionary: double-click word -> modal with word, definition, and Play word/Play definition audio
- * - TTS: browser SpeechSynthesis or server (eSpeak) for Read page, Speak selection, dictionary modal
+ * - TTS: browser SpeechSynthesis or server for Read page, Speak selection, dictionary modal
+ *
+ * Features:
+ * - Mute sound: when enabled, all TTS and audio playback is suppressed (Test voice still plays for preview).
+ * - Voice: select from all browser voices (grouped by language); "Test voice" plays a sample.
+ * - Voice navigation: optional SpeechRecognition for hands-free commands (open/close, read page, stop, etc.).
+ * - Keyboard: Alt+A (Windows) / Option+A (Mac) to open/close; Escape to close; Tab/focus trap in panel; R/S in panel for Read/Stop.
+ * - Presets: built-in (High contrast, Reading, Minimal, Focus) and user-saved presets; apply via dropdown or API.
+ * - Translation: OSS Translate (LibreTranslate API), then apiBase action=translate, then MyMemory; chunked for long text.
+ * - Extended languages: LANGUAGES list for TTS language and Translate target (40+ languages).
+ * - Utilities: debounce, throttle, getPreferredColorScheme, getPreferredReducedMotion, hasAccessibleLabel, getControlLabel.
+ * - Public API: init() returns { getState, setState, openPanel, closePanel, reset, stopTTS, getPresets, applyPreset, saveCurrentAsPreset, deletePreset, showKeyboardShortcuts, showAbout, translate, version, events }.
+ * - Events: openaccessible:ready, openaccessible:change, openaccessible:preset:apply, openaccessible:tts:start, openaccessible:tts:stop, openaccessible:translate:start, openaccessible:translate:done.
  */
 (function (global) {
     'use strict';
   
     // --- Constants ---
-    const STORAGE_KEY = 'openaccessible_prefs';
+    const STORAGE_KEY = 'openaccessible_prefs';  // localStorage key for persisted preferences
     const WIDGET_VERSION = '1.0.0';
     const ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Universal Access icon - body moved up more"><circle cx="256" cy="256" r="220" fill="#0F172A"/><circle cx="256" cy="256" r="240" fill="none" stroke="#22D3EE" stroke-width="14"/><circle cx="256" cy="256" r="220" fill="none" stroke="#22D3EE" stroke-width="8" opacity="0.75"/><g transform="translate(0,-22)" fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round"><circle cx="256" cy="150" r="44" fill="#FFFFFF" stroke="none"/><g stroke="#0F172A" stroke-width="14" stroke-linecap="round"><circle cx="238" cy="142" r="10" fill="#0F172A" stroke="none"/><circle cx="274" cy="142" r="10" fill="#0F172A" stroke="none"/><path d="M256 152 L254 162" fill="none"/><path d="M238 172 Q256 188 274 172" fill="none"/></g><path d="M132 224 L380 224" stroke-width="36"/><path d="M256 210 V334" stroke-width="44"/><path d="M256 334 L206 432" stroke-width="36"/><path d="M256 334 L306 432" stroke-width="36"/><path d="M206 444 L172 444" stroke-width="30"/><path d="M306 444 L340 444" stroke-width="30"/></g></svg>';
   
@@ -30,9 +44,11 @@
       highlightHeadings: false,
       highlightFocus: true,
       ttsEnabled: false,
+      ttsMuted: false,              // when true, no TTS or audio plays (except Test voice)
       ttsRate: 1,
       ttsPitch: 1,
-      ttsVoice: null,
+      ttsVoice: null,               // selected SpeechSynthesis voice name
+      voiceNavigationEnabled: false, // SpeechRecognition for voice commands
       textAlign: '',                 // '' | left | center | right | justify
       language: '',
       reduceMotion: false,
@@ -54,14 +70,773 @@
       showLinkUrl: false,
       reduceTransparency: false,
       highlightForms: false,
-      contentWidth: 'full',          // full | narrow | narrower
+contentWidth: 'full',          // full | narrow | narrower
+      guestMode: false,         // when true, do not persist to localStorage
+      lastPresetName: null,     // last applied preset name for UI
     };
-  
-    // --- Mutable state and DOM refs ---
+
+    // --- Extended language list for TTS, translation, and panel ---
+    
+    // Default languages for OpenAccessible is English
+    const LANGUAGES = [
+      { code: '', name: 'Default' },
+      { code: 'en', name: 'English' },
+      { code: 'es', name: 'Spanish' },
+      { code: 'fr', name: 'French' },
+      { code: 'de', name: 'German' },
+      { code: 'it', name: 'Italian' },
+      { code: 'pt', name: 'Portuguese' },
+      { code: 'pt-BR', name: 'Portuguese (Brazil)' },
+      { code: 'nl', name: 'Dutch' },
+      { code: 'pl', name: 'Polish' },
+      { code: 'ru', name: 'Russian' },
+      { code: 'uk', name: 'Ukrainian' },
+      { code: 'ar', name: 'Arabic' },
+      { code: 'zh', name: 'Chinese' },
+      { code: 'zh-CN', name: 'Chinese (Simplified)' },
+      { code: 'zh-TW', name: 'Chinese (Traditional)' },
+      { code: 'ja', name: 'Japanese' },
+      { code: 'ko', name: 'Korean' },
+      { code: 'hi', name: 'Hindi' },
+      { code: 'bn', name: 'Bengali' },
+      { code: 'tr', name: 'Turkish' },
+      { code: 'vi', name: 'Vietnamese' },
+      { code: 'th', name: 'Thai' },
+      { code: 'id', name: 'Indonesian' },
+      { code: 'ms', name: 'Malay' },
+      { code: 'he', name: 'Hebrew' },
+      { code: 'fa', name: 'Persian' },
+      { code: 'sv', name: 'Swedish' },
+      { code: 'da', name: 'Danish' },
+      { code: 'no', name: 'Norwegian' },
+      { code: 'fi', name: 'Finnish' },
+      { code: 'el', name: 'Greek' },
+      { code: 'ro', name: 'Romanian' },
+      { code: 'hu', name: 'Hungarian' },
+      { code: 'cs', name: 'Czech' },
+      { code: 'sk', name: 'Slovak' },
+      { code: 'bg', name: 'Bulgarian' },
+      { code: 'hr', name: 'Croatian' },
+      { code: 'sr', name: 'Serbian' },
+      { code: 'sl', name: 'Slovenian' },
+      { code: 'et', name: 'Estonian' },
+      { code: 'lv', name: 'Latvian' },
+      { code: 'lt', name: 'Lithuanian' },
+      { code: 'ca', name: 'Catalan' },
+      { code: 'eu', name: 'Basque' },
+      { code: 'gl', name: 'Galician' },
+      { code: 'af', name: 'Afrikaans' },
+      { code: 'sq', name: 'Albanian' },
+      { code: 'hy', name: 'Armenian' },
+      { code: 'az', name: 'Azerbaijani' },
+      { code: 'be', name: 'Belarusian' },
+      { code: 'bs', name: 'Bosnian' },
+      { code: 'cy', name: 'Welsh' },
+      { code: 'ga', name: 'Irish' },
+      { code: 'ka', name: 'Georgian' },
+      { code: 'is', name: 'Icelandic' },
+      { code: 'mk', name: 'Macedonian' },
+      { code: 'mt', name: 'Maltese' },
+      { code: 'mn', name: 'Mongolian' },
+      { code: 'ne', name: 'Nepali' },
+      { code: 'pa', name: 'Punjabi' },
+      { code: 'sw', name: 'Swahili' },
+      { code: 'tl', name: 'Tagalog' },
+      { code: 'ur', name: 'Urdu' },
+    ];
+
+    // --- Keyboard shortcuts reference (for help modal) ---
+    const KEYBOARD_SHORTCUTS = [
+      { keys: 'Alt+A (Win) / Option+A (Mac)', action: 'Open or close accessibility panel' },
+      { keys: 'Escape', action: 'Close panel, reading view, or overlay' },
+      { keys: 'Tab / Shift+Tab', action: 'Move focus between controls' },
+      { keys: 'Enter / Space', action: 'Activate button or option' },
+      { keys: 'R (in panel)', action: 'Read page with text-to-speech' },
+      { keys: 'S (in panel)', action: 'Stop reading' },
+      { keys: 'Arrow keys', action: 'Change value of range or select' },
+      { keys: 'Double-click word', action: 'Open dictionary (when enabled)' },
+      { keys: 'Select text + bar', action: 'Speak or translate selection' },
+      { keys: 'Focus in panel', action: 'Tab cycles through all controls' },
+      { keys: 'Voice (when enabled)', action: 'Say "Open accessibility", "Read page", "Stop", etc.' },
+    ];
+
+    // Color filter options for UI or docs.
+    var COLOR_FILTER_OPTIONS = [
+      { value: 'none', label: 'None' },
+      { value: 'grayscale', label: 'Grayscale' },
+      { value: 'invert', label: 'Invert' },
+      { value: 'sepia', label: 'Sepia' },
+      { value: 'protanopia', label: 'Protanopia' },
+      { value: 'deuteranopia', label: 'Deuteranopia' },
+      { value: 'tritanopia', label: 'Tritanopia' },
+      { value: 'dark', label: 'Dark theme' },
+      { value: 'light', label: 'Light theme' },
+    ];
+
+    // Toolbar position options.
+    var TOOLBAR_POSITION_OPTIONS = [
+      { value: 'bottom-right', label: 'Bottom right' },
+      { value: 'bottom-left', label: 'Bottom left' },
+      { value: 'top-right', label: 'Top right' },
+      { value: 'top-left', label: 'Top left' },
+    ];
+
+    // Common translation language pairs for UI hints.
+    var TRANSLATE_LANG_PAIRS = [
+      { from: 'en', to: 'es', label: 'English to Spanish' },
+      { from: 'en', to: 'fr', label: 'English to French' },
+      { from: 'en', to: 'de', label: 'English to German' },
+      { from: 'en', to: 'zh', label: 'English to Chinese' },
+      { from: 'en', to: 'ja', label: 'English to Japanese' },
+      { from: 'es', to: 'en', label: 'Spanish to English' },
+      { from: 'fr', to: 'en', label: 'French to English' },
+    ];
+
+    // Return version and basic info for debugging.
+    function getVersionInfo() {
+      return { version: WIDGET_VERSION, stateKeysCount: Object.keys(defaultState).length, languagesCount: LANGUAGES.length };
+    }
+
+    // --- Preset storage key and max presets ---
+    const PRESETS_STORAGE_KEY = 'openaccessible_presets';
+    const MAX_PRESETS = 10;
+    const BUILTIN_PRESET_IDS = ['high-contrast', 'reading', 'minimal', 'focus'];
+
+    // --- Default built-in presets (name -> partial state) ---
+    const BUILTIN_PRESETS = {
+      'high-contrast': {
+        name: 'High contrast',
+        state: { colorFilter: 'dark', contrast: 1.4, highlightFocus: true, enlargeFocus: true, reduceTransparency: true },
+      },
+      'reading': {
+        name: 'Reading',
+        state: { letterSpacing: 'wide', lineHeight: 'relaxed', wordSpacing: 'wide', fontSize: 110, dyslexiaFont: false, highlightAsRead: true },
+      },
+      'minimal': {
+        name: 'Minimal',
+        state: { colorFilter: 'none', contrast: 1, fontSize: 100, letterSpacing: 'normal', lineHeight: 'normal', wordSpacing: 'normal', highlightLinks: false, highlightHeadings: false },
+      },
+      'focus': {
+        name: 'Focus & visibility',
+        state: { highlightFocus: true, enlargeFocus: true, focusStrip: true, readingGuide: false, highlightForms: true },
+      },
+    };
+
+    // --- API request timeout (ms) and retry count ---
+    const API_TIMEOUT_MS = 15000;
+    const API_RETRY_COUNT = 2;
+    const TRANSLATE_CHUNK_MAX_CHARS = 800;
+    const TRANSLATE_CHUNK_SEPARATOR = /\n\n+|\n|(?<=[.!?])\s+/;
+
+    // --- Localization strings (en); keys used for panel labels, tooltips, messages ---
+    const STRINGS = {
+      panelTitle: 'Accessibility',
+      closePanel: 'Close panel',
+      colorContrast: 'Color & contrast',
+      filter: 'Filter',
+      contrast: 'Contrast',
+      readingDyslexia: 'Reading & dyslexia',
+      openDyslexic: 'OpenDyslexic font',
+      size: 'Size',
+      highlight: 'Highlight',
+      links: 'Links',
+      headings: 'Headings',
+      focus: 'Focus',
+      tts: 'Text-to-speech',
+      ttsEnable: 'Enable read aloud',
+      mute: 'Mute all TTS',
+      rate: 'Rate',
+      pitch: 'Pitch',
+      voice: 'Voice',
+      testVoice: 'Test voice',
+      voiceNav: 'Enable voice commands',
+      voiceNavHint: 'Say: open/close accessibility, read page, stop, speak selection, next heading, show headings.',
+      translate: 'Translate',
+      translateTo: 'Translate to',
+      translateSelection: 'Translate selection',
+      translatePage: 'Translate page',
+      presets: 'Presets',
+      applyPreset: 'Apply a preset…',
+      moreSpacing: 'More spacing',
+      highContrast: 'High contrast',
+      navigation: 'Navigation',
+      headingsList: 'Headings',
+      imageDescriptions: 'Image descriptions',
+      visibilityFocus: 'Visibility & focus',
+      enlargeFocus: 'Enlarge focus indicator',
+      showLinkUrl: 'Show link URL on focus',
+      reduceTransparency: 'Reduce transparency',
+      highlightForms: 'Highlight form fields',
+      layout: 'Layout',
+      contentWidth: 'Content width',
+      full: 'Full',
+      narrow: 'Narrow (65ch)',
+      narrower: 'Narrower (45ch)',
+      more: 'More',
+      monospace: 'Monospace font',
+      focusStrip: 'Focus strip (dim except line)',
+      reduceMotion: 'Reduce motion',
+      readingGuide: 'Reading guide',
+      screenReaderHints: 'Screen reader / Braille hints',
+      toolbarPosition: 'Toolbar position',
+      bottomRight: 'Bottom right',
+      bottomLeft: 'Bottom left',
+      topRight: 'Top right',
+      topLeft: 'Top left',
+      settings: 'Settings',
+      exportSettings: 'Export settings',
+      importSettings: 'Import settings',
+      keyboardShortcuts: 'Keyboard shortcuts',
+      about: 'About',
+      resetAll: 'Reset all',
+      poweredBy: 'Powered by OpenAccessible',
+      accountLinked: 'Account linked',
+      selectTextFirst: 'Select text first, then click Translate selection.',
+      translationUnavailable: 'Translation unavailable. Set Translate to a language and try again.',
+      chooseLanguageFirst: 'Choose a language under Translate to, then click Translate page.',
+      translationFailed: 'Translation failed.',
+      defaultVoice: 'Default',
+      highContrastPreset: 'High contrast',
+      readingPreset: 'Reading',
+      minimalPreset: 'Minimal',
+      focusPreset: 'Focus & visibility',
+      myPreset: 'My preset',
+      applyPresetPlaceholder: 'Apply a preset…',
+      keyboardShortcutsTitle: 'Keyboard shortcuts',
+      aboutTitle: 'About',
+      aboutVersion: 'Open Accessible widget',
+      aboutDescription: 'Accessibility settings for WCAG 2.2 AA: color, contrast, TTS, translation, and more.',
+      close: 'Close',
+      readPage: 'Read page',
+      stop: 'Stop',
+      speakSelection: 'Speak selection',
+      imageAltMissing: 'Image has no alt text',
+      imageAlt: 'Image',
+      headingLevel: 'Heading',
+      linkOpensNewWindow: 'Opens in new window',
+      linkTo: 'Link to',
+      formField: 'Form field',
+      formFieldNoLabel: 'Form field has no visible label',
+      skipToContent: 'Skip to main content',
+      loading: 'Loading…',
+      error: 'Error',
+      success: 'Success',
+      cancel: 'Cancel',
+      save: 'Save',
+      delete: 'Delete',
+      export: 'Export',
+      import: 'Import',
+    };
+
+    // Build <option> elements from LANGUAGES for a select (value = code, text = name).
+    function buildLanguageOptions(includeDefault) {
+      var frag = document.createDocumentFragment();
+      if (includeDefault) {
+        var def = document.createElement('option');
+        def.value = '';
+        def.textContent = STRINGS.defaultVoice || 'Default';
+        frag.appendChild(def);
+      }
+      LANGUAGES.forEach(function (lang) {
+        if (lang.code === '') return;
+        var o = document.createElement('option');
+        o.value = lang.code;
+        o.textContent = lang.name;
+        frag.appendChild(o);
+      });
+      return frag;
+    }
+
+    // --- Utility: debounce, throttle, media query helpers ---
+    // Return a function that invokes fn after delay ms, canceling any pending previous call.
+    function debounce(fn, delay) {
+      var t = null;
+      return function () {
+        var self = this;
+        var args = arguments;
+        if (t) clearTimeout(t);
+        t = setTimeout(function () { fn.apply(self, args); t = null; }, delay);
+      };
+    }
+
+    // Return a function that invokes fn at most once per limit ms.
+    function throttle(fn, limit) {
+      var last = 0;
+      var timer = null;
+      return function () {
+        var self = this;
+        var args = arguments;
+        var now = Date.now();
+        if (now - last >= limit) {
+          last = now;
+          fn.apply(self, args);
+        } else if (!timer) {
+          timer = setTimeout(function () {
+            timer = null;
+            last = Date.now();
+            fn.apply(self, args);
+          }, limit - (now - last));
+        }
+      };
+    }
+
+    // Return 'dark' or 'light' from prefers-color-scheme, or null if not supported.
+    function getPreferredColorScheme() {
+      if (typeof global.matchMedia !== 'function') return null;
+      try {
+        return global.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      } catch (_) { return null; }
+    }
+
+    // Return true if user prefers reduced motion.
+    function getPreferredReducedMotion() {
+      if (typeof global.matchMedia !== 'function') return false;
+      try {
+        return global.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      } catch (_) { return false; }
+    }
+
+    // Return true if the element has an accessible name (aria-label, aria-labelledby, or associated label).
+    function hasAccessibleLabel(el) {
+      if (!el || el.nodeType !== 1) return false;
+      if (el.getAttribute('aria-label') && el.getAttribute('aria-label').trim()) return true;
+      if (el.getAttribute('aria-labelledby')) {
+        var id = el.getAttribute('aria-labelledby').trim().split(/\s+/)[0];
+        if (id && document.getElementById(id)) return true;
+      }
+      if (el.id && document.querySelector('label[for="' + el.id + '"]')) return true;
+      var label = el.closest('label');
+      if (label && label.control === el) return true;
+      return false;
+    }
+
+    // Get a short label for form control (for screen reader hints or tooltips).
+    function getControlLabel(el) {
+      if (!el || el.nodeType !== 1) return '';
+      var aria = el.getAttribute('aria-label');
+      if (aria && aria.trim()) return aria.trim();
+      var lid = el.getAttribute('aria-labelledby');
+      if (lid) {
+        var firstId = lid.trim().split(/\s+/)[0];
+        var lab = firstId && document.getElementById(firstId);
+        if (lab) return (lab.textContent || '').trim().slice(0, 100);
+      }
+      if (el.id) {
+        var forLabel = document.querySelector('label[for="' + el.id + '"]');
+        if (forLabel) return (forLabel.textContent || '').trim().slice(0, 100);
+      }
+      var parentLabel = el.closest('label');
+      if (parentLabel && parentLabel.control === el) return (parentLabel.textContent || '').trim().slice(0, 100);
+      return '';
+    }
+
+    // Apply reading-order numbers as data attributes for debugging (optional feature).
+    function applyReadingOrderIndicators(root) {
+      root = root || document.body;
+      var el = root.querySelector ? root : document.body;
+      var flow = [];
+      var walk = function (node) {
+        if (node.nodeType !== 1) return;
+        var tag = node.tagName.toLowerCase();
+        if (['script', 'style', 'noscript', 'svg', 'path'].indexOf(tag) >= 0) return;
+        if (node.getAttribute('aria-hidden') === 'true') return;
+        var role = node.getAttribute('role');
+        if (role === 'presentation' || role === 'none') return;
+        if (node.offsetParent === null && node.getBoundingClientRect().height === 0) return;
+        flow.push(node);
+        for (var i = 0; i < node.childNodes.length; i++) walk(node.childNodes[i]);
+      };
+      walk(el);
+      flow.forEach(function (n, i) {
+        n.setAttribute('data-oa-reading-order', String(i + 1));
+      });
+      return flow.length;
+    }
+
+    // Remove reading-order data attributes.
+    function removeReadingOrderIndicators(root) {
+      root = root || document.body;
+      var all = (root.querySelectorAll ? root : document.body).querySelectorAll('[data-oa-reading-order]');
+      all.forEach(function (el) { el.removeAttribute('data-oa-reading-order'); });
+    }
+
+    var formHintIdCounter = 0;
+    // Ensure form controls without accessible names get a screen-reader-only hint (when highlightForms). Removes previously added hints first.
+    function applyFormLabelHints(root) {
+      root = root || $root || document.body;
+      var container = root && root.querySelector ? root : document.body;
+      var existing = container.querySelectorAll('[data-oa-form-hint]');
+      existing.forEach(function (el) {
+        var id = el.getAttribute('data-oa-form-hint');
+        if (id) {
+          var hintEl = document.getElementById(id);
+          if (hintEl) hintEl.remove();
+        }
+        el.removeAttribute('data-oa-form-hint');
+        el.removeAttribute('aria-describedby');
+      });
+      if (!state.highlightForms) return;
+      var controls = container.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), select, textarea');
+      controls.forEach(function (el) {
+        if (hasAccessibleLabel(el)) return;
+        formHintIdCounter++;
+        var hintId = 'oa-form-hint-' + formHintIdCounter;
+        var hint = document.createElement('span');
+        hint.id = hintId;
+        hint.setAttribute('aria-hidden', 'true');
+        hint.style.cssText = 'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;';
+        hint.textContent = STRINGS.formFieldNoLabel || 'Form field has no visible label';
+        hint.setAttribute('data-oa-form-hint-span', '');
+        if (el.parentNode) {
+          el.parentNode.insertBefore(hint, el.nextSibling);
+          var described = el.getAttribute('aria-describedby') || '';
+          el.setAttribute('aria-describedby', (described + ' ' + hintId).trim());
+          el.setAttribute('data-oa-form-hint', hintId);
+        }
+      });
+    }
+
+    // Normalize and validate init options; return a safe copy for internal use.
+    function normalizeInitOptions(opts) {
+      var o = opts && typeof opts === 'object' ? opts : {};
+      var out = {};
+      if (typeof o.apiBase === 'string') out.apiBase = o.apiBase.replace(/\s+/g, '').trim();
+      else if (typeof o.apiUrl === 'string') out.apiBase = o.apiUrl.replace(/\s+/g, '').trim();
+      else out.apiBase = '';
+      if (typeof o.apiKey === 'string') out.apiKey = o.apiKey.trim();
+      else out.apiKey = '';
+      if (typeof o.userId === 'string') out.userId = o.userId.trim();
+      else if (typeof o.user_id === 'string') out.userId = o.user_id.trim();
+      else out.userId = '';
+      out.useServerTts = !!o.useServerTts;
+      if (typeof o.translateApiUrl === 'string') out.translateApiUrl = o.translateApiUrl.trim();
+      if (typeof o.iconUrl === 'string' && o.iconUrl.length > 0) out.iconUrl = o.iconUrl.trim();
+      if (typeof o.accountVerifyUrl === 'string' && o.accountVerifyUrl.length > 0) out.accountVerifyUrl = o.accountVerifyUrl.trim();
+      if (o.root !== undefined) {
+        if (typeof o.root === 'string') out.root = o.root;
+        else if (o.root && o.root.nodeType === 1) out.root = o.root;
+      }
+      return out;
+    }
+
+    // --- Lightweight accessibility checks (return data for host or UI) ---
+    // Return array of { level, text, id } for headings in root.
+    function getHeadingsSummary(root) {
+      root = root || document.body;
+      var container = root.querySelector ? root : document.body;
+      var headings = container.querySelectorAll('h1, h2, h3, h4, h5, h6');
+      return Array.prototype.map.call(headings, function (h) {
+        return { level: parseInt(h.tagName.charAt(1), 10), text: (h.textContent || '').trim().slice(0, 200), id: h.id || null };
+      });
+    }
+
+    // Return array of { src, alt, width, height } for images in root; alt is empty if missing.
+    function getImagesWithoutAlt(root) {
+      root = root || document.body;
+      var container = root.querySelector ? root : document.body;
+      var images = container.querySelectorAll('img');
+      var out = [];
+      images.forEach(function (img) {
+        var alt = (img.getAttribute('alt') || '').trim();
+        out.push({ src: img.src || img.getAttribute('src') || '', alt: alt, width: img.width || 0, height: img.height || 0, missingAlt: alt === '' });
+      });
+      return out;
+    }
+
+    // Return array of form controls that lack an accessible label.
+    function getFormFieldsWithoutLabels(root) {
+      root = root || document.body;
+      var container = root.querySelector ? root : document.body;
+      var controls = container.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), select, textarea');
+      var out = [];
+      controls.forEach(function (el) {
+        if (!hasAccessibleLabel(el)) out.push({ tag: el.tagName.toLowerCase(), type: el.type || '', name: el.name || '', id: el.id || null });
+      });
+      return out;
+    }
+
+    // Return a short summary of potential issues (counts). For use in dashboard or dev tools.
+    function getAccessibilitySummary(root) {
+      root = root || document.body;
+      var headings = getHeadingsSummary(root);
+      var images = getImagesWithoutAlt(root);
+      var noAlt = images.filter(function (i) { return i.missingAlt; });
+      var formFields = getFormFieldsWithoutLabels(root);
+      var lang = (document.documentElement.getAttribute('lang') || '').trim();
+      return {
+        headingsCount: headings.length,
+        imagesCount: images.length,
+        imagesMissingAlt: noAlt.length,
+        formFieldsWithoutLabel: formFields.length,
+        hasLang: lang.length > 0,
+      };
+    }
+
+    // --- Event names emitted by the widget (for host integration) ---
+    var WIDGET_EVENTS = {
+      ready: 'Widget initialized; detail: { state, version }',
+      change: 'User changed settings; detail: state',
+      'preset:apply': 'Preset applied; detail: { presetId, presetName }',
+      'preset:saved': 'Preset saved; detail: { presetId, presetName }',
+      'preset:deleted': 'Preset deleted; detail: { presetId }',
+      'tts:start': 'TTS started',
+      'tts:stop': 'TTS stopped',
+      'translate:start': 'Translation started; detail: { lang, length }',
+      'translate:done': 'Translation finished; detail: { lang, error? }',
+    };
+
+    /*
+     * Code flow overview (for maintainers):
+     * - State: defaultState holds all preference keys; state is the live object, persisted to localStorage (unless guestMode).
+     * - readStorage/writeStorage: load/save state; writeStorage is called after applyFromPanel and when state is updated programmatically.
+     * - Presets: getSavedPresets/setSavedPresets read/write user presets; applyPreset applies built-in or saved; saveCurrentAsPreset adds a new saved preset.
+     * - fetchWithTimeout: optional wrapper for fetch with AbortController timeout and retries; can be used by API calls.
+     * - getFocusableElements/trapFocus: used for modals and panel focus trap; getPanelFocusables/setupPanelFocusTrap are panel-specific.
+     * - showKeyboardShortcuts/showAbout: create dialogs with KEYBOARD_SHORTCUTS and version info; close on Escape or button.
+     * - buildLanguageOptions: builds <option> elements from LANGUAGES for language and translateTargetLang selects.
+     * - applyToDocument: applies state to $root (classes, styles, font-size, filter, etc.) and calls applyFormLabelHints when highlightForms is on.
+     * - applyFormLabelHints: when state.highlightForms is true, adds aria-describedby and a screen-reader-only span for form controls without labels.
+     * - normalizeInitOptions: sanitizes init(opts) so apiBase, apiKey, translateApiUrl, etc. are safe strings or defaults.
+     * - requestTranslate: tries translateApiUrl (LibreTranslate format), then apiBase?action=translate, then MyMemory; calls onDone(translatedText or null).
+     * - requestTranslateChunked: splits long text with splitTextIntoChunks, translates each chunk, concatenates results.
+     * - getHeadingsSummary/getImagesWithoutAlt/getFormFieldsWithoutLabels/getAccessibilitySummary: return data for host or dashboards.
+     * - Public API: init() returns an object with getState, setState, openPanel, closePanel, reset, stopTTS, getPresets, applyPreset, saveCurrentAsPreset,
+     *   deletePreset, showKeyboardShortcuts, showAbout, translate, getHeadingsSummary, getImagesWithoutAlt, getFormFieldsWithoutLabels,
+     *   getAccessibilitySummary, version, events.
+     */
+
+    // State key to short description (for debugging or generated docs).
+    var STATE_KEYS_DESCRIPTION = {
+      colorFilter: 'Color filter (none, grayscale, invert, sepia, protanopia, deuteranopia, tritanopia, dark, light)',
+      dyslexiaFont: 'Use OpenDyslexic-style font',
+      contrast: 'Contrast multiplier (1 = normal)',
+      fontSize: 'Base font size percentage',
+      cursorSize: 'Cursor size (default, large, xl)',
+      highlightLinks: 'Highlight links',
+      highlightHeadings: 'Highlight headings',
+      highlightFocus: 'Highlight focus ring',
+      ttsEnabled: 'Enable read-aloud on click',
+      ttsMuted: 'Mute all TTS',
+      ttsRate: 'Speech rate',
+      ttsPitch: 'Speech pitch',
+      ttsVoice: 'Selected TTS voice name',
+      voiceNavigationEnabled: 'Enable voice commands',
+      textAlign: 'Text alignment override',
+      language: 'Content language code for TTS',
+      reduceMotion: 'Respect prefers-reduced-motion',
+      underlineLinks: 'Underline links',
+      readingGuide: 'Show reading guide line',
+      toolbarPosition: 'Toolbar position (top/bottom left/right)',
+      dictionaryEnabled: 'Enable double-click dictionary',
+      letterSpacing: 'Letter spacing (normal, wide, wider)',
+      lineHeight: 'Line height (normal, relaxed, loose)',
+      wordSpacing: 'Word spacing',
+      highlightAsRead: 'Highlight words as TTS reads',
+      translateTargetLang: 'Translation target language code',
+      monospaceFont: 'Use monospace font',
+      focusStrip: 'Focus strip (dim except current line)',
+      enlargeFocus: 'Enlarge focus indicator',
+      showLinkUrl: 'Show link URL on focus',
+      reduceTransparency: 'Reduce transparency',
+      highlightForms: 'Highlight form fields and add hints',
+      contentWidth: 'Content width (full, narrow, narrower)',
+      guestMode: 'Do not persist to localStorage',
+    };
+
+    // CSS classes applied by the widget to the root (openaccessible-widget-root).
+    var WIDGET_ROOT_CLASSES = [
+      'oa-color-grayscale', 'oa-color-invert', 'oa-color-sepia', 'oa-color-protanopia', 'oa-color-deuteranopia', 'oa-color-tritanopia', 'oa-color-dark', 'oa-color-light',
+      'oa-dyslexia', 'oa-highlight-links', 'oa-highlight-headings', 'oa-focus-visible', 'oa-underline-links', 'oa-reduce-motion', 'oa-reading-guide',
+      'oa-ls-wide', 'oa-ls-wider', 'oa-lh-relaxed', 'oa-lh-loose', 'oa-ws-wide', 'oa-monospace', 'oa-focus-strip', 'oa-enlarge-focus', 'oa-show-link-url',
+      'oa-reduce-transparency', 'oa-highlight-forms', 'oa-content-narrow', 'oa-content-narrower',
+    ];
+
+    // Return suggested state overrides based on system preferences (reduced motion, color scheme).
+    function getSuggestedSettings() {
+      var suggested = {};
+      if (getPreferredReducedMotion()) suggested.reduceMotion = true;
+      var scheme = getPreferredColorScheme();
+      if (scheme === 'dark') suggested.colorFilter = 'dark';
+      else if (scheme === 'light') suggested.colorFilter = 'light';
+      return suggested;
+    }
+
+    // Return default state as a plain object (for reset or export template).
+    function getDefaultStateSnapshot() {
+      var out = {};
+      Object.keys(defaultState).forEach(function (k) {
+        if (k !== 'guestMode' && k !== 'lastPresetName') out[k] = defaultState[k];
+      });
+      return out;
+    }
+
+    /*
+     * Supported backend API actions (when apiBase is set):
+     * - GET  ?action=dictionary&word=...     -> { definition: string }
+     * - POST action=translate  body: { text, target } -> { translated: string }
+     * - GET  ?action=preferences_load&user_id=... -> { preferences: object }
+     * - POST action=preferences_save  body: { user_id, ...state } -> ok
+     * - POST action=tts  body: { text, lang, rate } -> { url: string|null } (optional server TTS)
+     * - GET  ?action=analytics_event&event_type=...&site_url=...&user_id=... (optional)
+     * All POST requests use Content-Type: application/json. Optional X-API-Key header when apiKey is set.
+     */
+
+    /*
+     * LibreTranslate / OSS Translate API (translateApiUrl):
+     * POST body: { q: string, source: string (e.g. "en"), target: string (e.g. "es") }
+     * Response: { translatedText: string } or error status.
+     * No API key required for default endpoint; some instances support api_key in body.
+     */
+
+    // Panel section titles and data-oa-opt control names (for automation or tests).
+    var PANEL_SECTIONS = [
+      { title: 'Color & contrast', opts: ['colorFilter', 'contrast'] },
+      { title: 'Reading & dyslexia', opts: ['dyslexiaFont'] },
+      { title: 'Size', opts: ['letterSpacing', 'lineHeight', 'wordSpacing', 'fontSize', 'cursorSize'] },
+      { title: 'Highlight', opts: ['highlightLinks', 'highlightHeadings', 'highlightFocus', 'underlineLinks'] },
+      { title: 'Text-to-speech', opts: ['ttsEnabled', 'ttsMuted', 'highlightAsRead', 'ttsRate', 'ttsPitch', 'ttsVoice'] },
+      { title: 'Voice commands', opts: ['voiceNavigationEnabled'] },
+      { title: 'Translate', opts: ['translateTargetLang'] },
+      { title: 'Text & language', opts: ['textAlign', 'language'] },
+      { title: 'Presets', opts: [] },
+      { title: 'Navigation', opts: [] },
+      { title: 'Visibility & focus', opts: ['enlargeFocus', 'showLinkUrl', 'reduceTransparency', 'highlightForms'] },
+      { title: 'Layout', opts: ['contentWidth'] },
+      { title: 'More', opts: ['monospaceFont', 'focusStrip', 'reduceMotion', 'readingGuide', 'screenReaderHints', 'toolbarPosition'] },
+      { title: 'Settings', opts: [] },
+    ];
+
+    /*
+     * Internal function index (for maintainers; not exhaustive):
+     * Storage: readStorage, writeStorage, getSavedPresets, setSavedPresets.
+     * Presets: applyPreset, saveCurrentAsPreset, deletePreset.
+     * Network: fetchWithTimeout.
+     * Focus: getFocusableElements, trapFocus, getPanelFocusables, setupPanelFocusTrap.
+     * Modals: showKeyboardShortcuts, showAbout.
+     * Options: buildLanguageOptions, normalizeInitOptions.
+     * DOM apply: applyToDocument, applyFormLabelHints, loadDyslexiaFont.
+     * Panel: createPanel, syncPanelFromState, applyFromPanel, updateToolbarPosition, updateToolbarActive.
+     * Toolbar: createToolbar.
+     * TTS: isTtsMuted, syncTtsVoiceFromPanel, getTtsVoiceObject, applyTtsOptionsToUtterance, stopTTS, speakElement, speakSelection, testVoice,
+     *   readPageWithTTS, openReadingViewAndSpeak, closeReadingView, escapeHtml, chunkTextForTts, playNextServerTts.
+     * Voice nav: getSpeechRecognition, stopVoiceNavigation, startVoiceNavigation, ensureVoiceNavigation.
+     * Translate: requestTranslate, requestTranslateChunked, splitTextIntoChunks, showTranslatedPageOverlay.
+     * Dictionary: initDictionary, showWordModal, speakTextForModalBrowser, fetchDefinition.
+     * UI: showTooltip, showHeadingsOutline, showImageDescriptions, showSelectionBar, hideSelectionBar.
+     * Export/import: exportSettings, importSettingsFromFile.
+     * Link URL: initLinkUrlOnFocus, onLinkFocusIn.
+     * Reading guide: initReadingGuide.
+     * Focus strip: ensureFocusStripMask, removeFocusStripMask.
+     * API: syncApiPreferences, checkOpenAccessibleAccount, updateFooterAccountBadge.
+     * A11y checks: getHeadingsSummary, getImagesWithoutAlt, getFormFieldsWithoutLabels, getAccessibilitySummary.
+     * Utilities: getSuggestedSettings, getDefaultStateSnapshot, debounce, throttle, getPreferredColorScheme, getPreferredReducedMotion,
+     *   hasAccessibleLabel, getControlLabel, applyReadingOrderIndicators, removeReadingOrderIndicators.
+     * Icon: getScriptBase, renderIcon.
+     * Styles: injectStyles.
+     * Skip link: injectSkipLink.
+     * Public: init, reset, togglePanel.
+     *
+     * State keys and types (for host or tooling):
+     * colorFilter: string (none|grayscale|invert|sepia|protanopia|deuteranopia|tritanopia|dark|light)
+     * dyslexiaFont: boolean
+     * contrast: number (1 = normal)
+     * fontSize: number (percentage)
+     * cursorSize: string (default|large|xl)
+     * highlightLinks, highlightHeadings, highlightFocus: boolean
+     * ttsEnabled, ttsMuted: boolean
+     * ttsRate, ttsPitch: number
+     * ttsVoice: string|null (voice name)
+     * voiceNavigationEnabled: boolean
+     * textAlign: string (''|left|center|right|justify)
+     * language: string (BCP 47 or '')
+     * reduceMotion, underlineLinks, readingGuide: boolean
+     * toolbarPosition: string (top|bottom + left|right)
+     * dictionaryEnabled, simplifiedWords, screenReaderHints: boolean
+     * letterSpacing: string (normal|wide|wider)
+     * lineHeight: string (normal|relaxed|loose)
+     * wordSpacing: string
+     * highlightAsRead: boolean
+     * translateTargetLang: string (language code or '')
+     * monospaceFont, focusStrip, enlargeFocus, showLinkUrl: boolean
+     * reduceTransparency, highlightForms: boolean
+     * contentWidth: string (full|narrow|narrower)
+     * guestMode: boolean (do not persist)
+     * lastPresetName: string|null (UI only)
+     *
+     * Example OpenAccessibleConfig:
+     *   window.OpenAccessibleConfig = { apiBase: 'https://api.example.com/', apiKey: 'key', translateApiUrl: 'https://translate.example.com/translate' };
+     *
+     * Example event listeners:
+     *   window.addEventListener('openaccessible:ready', function (e) { console.log('Widget ready', e.detail.state); });
+     *   window.addEventListener('openaccessible:change', function (e) { console.log('Settings changed', e.detail); });
+     *   window.addEventListener('openaccessible:tts:start', function () { console.log('TTS started'); });
+     *   window.addEventListener('openaccessible:translate:done', function (e) { console.log('Translate done', e.detail); });
+     *
+     * Example programmatic usage:
+     *   var api = OpenAccessible.init({ apiBase: '/api/' });
+     *   api.openPanel();
+     *   api.applyPreset('high-contrast');
+     *   api.translate('Hello', 'es', function (text) { console.log(text); });
+     *   var summary = api.getAccessibilitySummary(); console.log(summary);
+     *
+     * Emit events (detail payloads):
+     *   openaccessible:ready       -> { state, version }
+     *   openaccessible:change       -> state (full object)
+     *   openaccessible:preset:apply -> { presetId, presetName }
+     *   openaccessible:preset:saved -> { presetId, presetName }
+     *   openaccessible:preset:deleted -> { presetId }
+     *   openaccessible:tts:start    -> {}
+     *   openaccessible:tts:stop     -> {}
+     *   openaccessible:translate:start -> { lang, length }
+     *   openaccessible:translate:done  -> { lang, error? }
+     */
+
+    // All data-oa-opt attribute values used in the panel (for automation or validation).
+    var PANEL_OPT_NAMES = [
+      'colorFilter', 'contrast', 'dyslexiaFont', 'fontSize', 'cursorSize', 'highlightLinks', 'highlightHeadings', 'highlightFocus',
+      'underlineLinks', 'letterSpacing', 'lineHeight', 'wordSpacing', 'ttsEnabled', 'ttsMuted', 'highlightAsRead', 'ttsRate', 'ttsPitch', 'ttsVoice',
+      'voiceNavigationEnabled', 'translateTargetLang', 'textAlign', 'language', 'dictionaryEnabled', 'screenReaderHints',
+      'enlargeFocus', 'showLinkUrl', 'reduceTransparency', 'highlightForms', 'contentWidth', 'monospaceFont', 'focusStrip',
+      'reduceMotion', 'readingGuide', 'toolbarPosition', 'simplifiedWords',
+    ];
+
+    // Spacing option values for letter, line, word.
+    var SPACING_OPTIONS = {
+      letterSpacing: [{ value: 'normal', label: 'Normal' }, { value: 'wide', label: 'Wide' }, { value: 'wider', label: 'Wider' }],
+      lineHeight: [{ value: 'normal', label: 'Normal' }, { value: 'relaxed', label: 'Relaxed' }, { value: 'loose', label: 'Loose' }],
+      wordSpacing: [{ value: 'normal', label: 'Normal' }, { value: 'wide', label: 'Wide' }],
+    };
+
+    // Cursor size options.
+    var CURSOR_SIZE_OPTIONS = [
+      { value: 'default', label: 'Default' },
+      { value: 'large', label: 'Large' },
+      { value: 'xl', label: 'Extra large' },
+    ];
+
+    // Content width options.
+    var CONTENT_WIDTH_OPTIONS = [
+      { value: 'full', label: 'Full' },
+      { value: 'narrow', label: 'Narrow (65ch)' },
+      { value: 'narrower', label: 'Narrower (45ch)' },
+    ];
+
+    // Text align options for state.textAlign.
+    var TEXT_ALIGN_OPTIONS = [
+      { value: '', label: 'Default' },
+      { value: 'left', label: 'Left' },
+      { value: 'center', label: 'Center' },
+      { value: 'right', label: 'Right' },
+      { value: 'justify', label: 'Justify' },
+    ];
+
+    // --- Mutable state and DOM refs (state, apiBase, panel, toolbar, etc.) ---
+    // State is merged with defaultState and persisted to localStorage unless guestMode is true.
     let state = { ...defaultState };
     let apiBase = '';
     let apiKey = '';
     let apiUserId = '';
+    let translateApiUrl = 'https://osstranslate-bvxf8-u5208.vm.elestio.app/translate';  // LibreTranslate-style; set to '' to use only apiBase/MyMemory
     let $root = null;
     let $panel = null;
     let activeHighlights = [];
@@ -75,9 +850,13 @@
     let iconUrl = '';
     let accountVerifyUrl = 'https://api.openaccessible.com/v1/verify';
     let hasOpenAccessibleAccount = false;
+    let voiceRecognition = null;    // SpeechRecognition instance when voice nav is on
+    let voiceRecognitionActive = false;
   
     // --- Storage & events ---
+// Load saved preferences from localStorage into state.
     function readStorage() {
+      if (state.guestMode) return;
       try {
         const raw = global.localStorage.getItem(STORAGE_KEY);
         if (raw) {
@@ -86,30 +865,194 @@
         }
       } catch (_) {}
     }
-  
+
+    // Persist current state to localStorage (no-op when guestMode).
     function writeStorage() {
+      if (state.guestMode) return;
       try {
-        global.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        const toSave = { ...state };
+        delete toSave.guestMode;
+        delete toSave.lastPresetName;
+        global.localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
       } catch (_) {}
     }
+
+    // Return list of user-saved presets from localStorage.
+    function getSavedPresets() {
+      try {
+        const raw = global.localStorage.getItem(PRESETS_STORAGE_KEY);
+        if (raw) return JSON.parse(raw);
+      } catch (_) {}
+      return [];
+    }
+
+    // Save list of user presets to localStorage.
+    function setSavedPresets(list) {
+      try {
+        global.localStorage.setItem(PRESETS_STORAGE_KEY, JSON.stringify(list.slice(0, MAX_PRESETS)));
+      } catch (_) {}
+    }
+
+    // Apply a built-in or saved preset by id or name; updates state, document, storage, panel.
+    function applyPreset(idOrName) {
+      const builtin = BUILTIN_PRESETS[idOrName];
+      if (builtin) {
+        const patch = builtin.state;
+        Object.keys(patch).forEach(function (k) {
+          if (defaultState.hasOwnProperty(k)) state[k] = patch[k];
+        });
+        state.lastPresetName = builtin.name;
+        writeStorage();
+        applyToDocument();
+        if ($panel) syncPanelFromState();
+        syncApiPreferences('save');
+        emit('preset:apply', { presetId: idOrName, presetName: builtin.name });
+        return;
+      }
+      const saved = getSavedPresets().find(function (p) { return p.id === idOrName || p.name === idOrName; });
+      if (saved && saved.state) {
+        Object.keys(saved.state).forEach(function (k) {
+          if (defaultState.hasOwnProperty(k)) state[k] = saved.state[k];
+        });
+        state.lastPresetName = saved.name;
+        writeStorage();
+        applyToDocument();
+        if ($panel) syncPanelFromState();
+        syncApiPreferences('save');
+        emit('preset:apply', { presetId: saved.id, presetName: saved.name });
+      }
+    }
+
+    // Save current state as a named preset. Returns new preset id or null if at limit.
+    function saveCurrentAsPreset(name) {
+      var list = getSavedPresets();
+      if (list.length >= MAX_PRESETS) return null;
+      var id = 'user-' + Date.now();
+      var snapshot = {};
+      Object.keys(defaultState).forEach(function (k) {
+        if (k !== 'guestMode' && k !== 'lastPresetName' && state.hasOwnProperty(k)) snapshot[k] = state[k];
+      });
+      list.push({ id: id, name: name || 'My preset', state: snapshot });
+      setSavedPresets(list);
+      emit('preset:saved', { presetId: id, presetName: name || 'My preset' });
+      return id;
+    }
+
+    // Delete a user preset by id.
+    function deletePreset(id) {
+      var list = getSavedPresets().filter(function (p) { return p.id !== id; });
+      setSavedPresets(list);
+      emit('preset:deleted', { presetId: id });
+    }
+
+    // Fetch with timeout and optional retries. Returns promise that resolves to response.json() or rejects.
+    function fetchWithTimeout(url, options, timeoutMs, retries) {
+      timeoutMs = timeoutMs || API_TIMEOUT_MS;
+      retries = retries != null ? retries : API_RETRY_COUNT;
+      function attempt(n) {
+        var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        var timeoutId = null;
+        if (controller) {
+          timeoutId = global.setTimeout(function () { controller.abort(); }, timeoutMs);
+          options = options || {};
+          options.signal = controller.signal;
+        }
+        return fetch(url, options)
+          .then(function (r) {
+            if (timeoutId) global.clearTimeout(timeoutId);
+            return r;
+          })
+          .catch(function (err) {
+            if (timeoutId) global.clearTimeout(timeoutId);
+            if (n < retries) return attempt(n + 1);
+            return Promise.reject(err);
+          });
+      }
+      return attempt(0).then(function (r) { return r.json ? r.json() : r.text(); });
+    }
   
+// Dispatch a custom event 'openaccessible:' + name for host page integration.
     function emit(name, detail) {
       try {
         global.dispatchEvent(new CustomEvent('openaccessible:' + name, { detail }));
       } catch (_) {}
     }
-  
+
+    // Return focusable elements within container (buttons, links, inputs, selects, textareas, [tabindex>=0]).
+    function getFocusableElements(container) {
+      if (!container || !container.querySelectorAll) return [];
+      var selector = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+      return Array.prototype.filter.call(container.querySelectorAll(selector), function (el) {
+        return el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+      });
+    }
+
+    // Trap focus inside container on Tab/Shift+Tab. Call on panel or modal mount; remove listener on unmount.
+    function trapFocus(container) {
+      if (!container) return function () {};
+      function handleKeyDown(e) {
+        if (e.key !== 'Tab') return;
+        var focusable = getFocusableElements(container);
+        if (focusable.length === 0) return;
+        var first = focusable[0];
+        var last = focusable[focusable.length - 1];
+        if (e.shiftKey) {
+          if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+        } else {
+          if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
+      }
+      container.addEventListener('keydown', handleKeyDown);
+      return function () { container.removeEventListener('keydown', handleKeyDown); };
+    }
+
+    // Show keyboard shortcuts help modal; close on Escape or backdrop click.
+    function showKeyboardShortcuts() {
+      var existing = document.getElementById('oa-shortcuts-modal');
+      if (existing) { existing.remove(); return; }
+      var wrap = document.createElement('div');
+      wrap.id = 'oa-shortcuts-modal';
+      wrap.className = 'oa-reading-view';
+      wrap.setAttribute('role', 'dialog');
+      wrap.setAttribute('aria-label', 'Keyboard shortcuts');
+      var rows = KEYBOARD_SHORTCUTS.map(function (s) {
+        return '<tr><td class="oa-shortcuts-keys">' + escapeHtml(s.keys) + '</td><td>' + escapeHtml(s.action) + '</td></tr>';
+      }).join('');
+      wrap.innerHTML = '<h4>Keyboard shortcuts</h4><button type="button" class="oa-reading-view-close" aria-label="Close">×</button><table class="oa-shortcuts-table"><tbody>' + rows + '</tbody></table>';
+      function close() { wrap.remove(); }
+      wrap.querySelector('.oa-reading-view-close').addEventListener('click', close);
+      wrap.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+      document.body.appendChild(wrap);
+      var btn = wrap.querySelector('.oa-reading-view-close');
+      if (btn) btn.focus();
+    }
+
+    // Show About modal (version, link).
+    function showAbout() {
+      var existing = document.getElementById('oa-about-modal');
+      if (existing) { existing.remove(); return; }
+      var wrap = document.createElement('div');
+      wrap.id = 'oa-about-modal';
+      wrap.className = 'oa-reading-view';
+      wrap.setAttribute('role', 'dialog');
+      wrap.setAttribute('aria-label', 'About Open Accessible');
+      wrap.innerHTML = '<h4>About</h4><button type="button" class="oa-reading-view-close" aria-label="Close">×</button><p>Open Accessible widget v' + WIDGET_VERSION + '.</p><p>Accessibility settings for WCAG 2.2 AA: color, contrast, TTS, translation, and more.</p><p><a href="https://github.com/OpenAccessible/OpenAccessible" target="_blank" rel="noopener noreferrer">GitHub</a></p>';
+      function close() { wrap.remove(); }
+      wrap.querySelector('.oa-reading-view-close').addEventListener('click', close);
+      wrap.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+      document.body.appendChild(wrap);
+      var btn = wrap.querySelector('.oa-reading-view-close');
+      if (btn) btn.focus();
+    }
+
+    // Resolve base URL for widget assets from the script src (e.g. for icon.svg).
     function getScriptBase() {
       const s = document.currentScript || document.querySelector('script[src*="widget"]');
       if (s && s.src) return s.src.replace(/\/[^/?#]+(?:\?.*)?$/, '/');
       return '';
     }
-
-    function getFontsBase() {
-      if (apiBase && apiBase.replace) return apiBase.replace(/\?.*$/, '') + '/fonts/';
-      return getScriptBase() + 'api/fonts/';
-    }
   
+    // Return an icon element (img if iconUrl set, else inline SVG).
     function renderIcon(className) {
       const c = className || 'oa-icon';
       if (iconUrl) {
@@ -127,21 +1070,22 @@
       return el;
     }
   
-    // --- Inject widget and panel styles (including word modal, dark theme) ---
+    // --- Inject widget and panel styles (including word modal, dark theme, voice nav hint) ---
+    // Add a single <style> block with all widget CSS if not already present.
     function injectStyles() {
       const id = 'openaccessible-styles';
       if (document.getElementById(id)) return;
       const css = `
-        .openaccessible-widget-root{--oa-zoom:1;--oa-contrast:1;--oa-cursor:default;--oa-align:left;--oa-ls:normal;--oa-lh:normal;--oa-ws:normal;font-family:'Ubuntu',sans-serif !important;}
+        .openaccessible-widget-root{--oa-zoom:1;--oa-contrast:1;--oa-cursor:default;--oa-align:left;--oa-ls:normal;--oa-lh:normal;--oa-ws:normal;}
         .openaccessible-widget-root.oa-color-grayscale{filter:grayscale(1);}
         .openaccessible-widget-root.oa-color-invert{filter:invert(1);}
         .openaccessible-widget-root.oa-color-sepia{filter:sepia(1);}
         .openaccessible-widget-root.oa-color-protanopia{filter:url(#oa-protanopia);}
         .openaccessible-widget-root.oa-color-deuteranopia{filter:url(#oa-deuteranopia);}
         .openaccessible-widget-root.oa-color-tritanopia{filter:url(#oa-tritanopia);}
-        .openaccessible-widget-root.oa-color-dark{filter:brightness(0.85) contrast(1.2);background:#1a1a1a !important;color:#f1f5f9 !important;}
+        .openaccessible-widget-root.oa-color-dark{filter:brightness(0.85) contrast(1.2);background:#1a1a1a !important;color:#e0e0e0 !important;}
         .openaccessible-widget-root.oa-color-light{filter:brightness(1.1) contrast(1.1);background:#f5f5f5 !important;color:#111 !important;}
-        .openaccessible-widget-root.oa-dyslexia,.openaccessible-widget-root.oa-dyslexia body,.openaccessible-widget-root.oa-dyslexia .oa-panel,.openaccessible-widget-root.oa-dyslexia *{font-family:'OpenDyslexic',sans-serif !important;}
+        .openaccessible-widget-root.oa-dyslexia,.openaccessible-widget-root.oa-dyslexia body,.openaccessible-widget-root.oa-dyslexia .oa-panel,.openaccessible-widget-root.oa-dyslexia *{font-family:'Open-Dyslexic',OpenDyslexic,'Comic Sans MS',sans-serif !important;}
         .openaccessible-widget-root.oa-highlight-links a{outline:2px solid #0a7ea4 !important;outline-offset:2px;}
         .openaccessible-widget-root.oa-highlight-headings h1,.openaccessible-widget-root.oa-highlight-headings h2,.openaccessible-widget-root.oa-highlight-headings h3,.openaccessible-widget-root.oa-highlight-headings h4,.openaccessible-widget-root.oa-highlight-headings h5,.openaccessible-widget-root.oa-highlight-headings h6{outline:2px dashed #0a7ea4;outline-offset:4px;}
         .openaccessible-widget-root.oa-focus-visible *:focus-visible{outline:3px solid #0a7ea4 !important;outline-offset:2px !important;}
@@ -184,6 +1128,12 @@
         .oa-overlay-list li{padding:8px 12px;border-radius:8px;cursor:pointer;}
         .oa-overlay-list li:hover{background:rgba(34,211,238,0.15);}
         .oa-overlay-list li a{color:inherit;text-decoration:none;}
+        .oa-shortcuts-table{width:100%;border-collapse:collapse;margin-top:12px;}
+        .oa-shortcuts-table td{padding:8px 12px;border-bottom:1px solid rgba(0,0,0,0.08);}
+        .oa-shortcuts-keys{font-family:monospace;white-space:nowrap;}
+        body.oa-widget-dark .oa-shortcuts-table td{border-color:rgba(255,255,255,0.1);}
+        .oa-preset-select-wrap{margin-top:8px;}
+        .oa-preset-select-wrap select{max-width:100%;}
         .oa-toolbar{position:fixed;z-index:2147483646;font-family:system-ui,-apple-system,sans-serif;}
         .oa-toolbar[data-pos="bottom-right"]{bottom:20px;right:20px;}
         .oa-toolbar[data-pos="bottom-left"]{bottom:20px;left:20px;}
@@ -244,8 +1194,6 @@
         .oa-word-modal{background:#fff;border-radius:16px;box-shadow:0 24px 48px rgba(0,0,0,0.2);max-width:400px;width:100%;padding:24px;position:relative;}
         .oa-word-modal .oa-word-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#22D3EE;margin:0 0 4px;}
         .oa-word-modal h2{margin:0 0 16px;font-size:1.5rem;font-weight:700;color:#0F172A;}
-        .oa-word-modal .oa-pron-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#22D3EE;margin:0 0 4px;}
-        .oa-word-modal .oa-word-pron{margin:0 0 12px;font-size:14px;font-style:italic;color:#64748b;}
         .oa-word-modal .oa-def-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#22D3EE;margin:0 0 4px;}
         .oa-word-modal .oa-word-def{margin:0 0 20px;font-size:15px;line-height:1.5;color:#334155;}
         .oa-word-modal .oa-word-audio{display:flex;gap:10px;flex-wrap:wrap;}
@@ -256,9 +1204,8 @@
         .oa-word-modal .oa-close-modal:hover{background:#e2e8f0;}
         body.oa-widget-dark .oa-word-modal-backdrop{background:rgba(0,0,0,0.7);}
         body.oa-widget-dark .oa-word-modal{background:#1e293b;box-shadow:0 24px 48px rgba(0,0,0,0.5);}
-        body.oa-widget-dark .oa-word-modal .oa-word-label,body.oa-widget-dark .oa-word-modal .oa-def-label,body.oa-widget-dark .oa-word-modal .oa-pron-label{color:#67e8f9;}
+        body.oa-widget-dark .oa-word-modal .oa-word-label,body.oa-widget-dark .oa-word-modal .oa-def-label{color:#67e8f9;}
         body.oa-widget-dark .oa-word-modal h2{color:#f1f5f9;}
-        body.oa-widget-dark .oa-word-modal .oa-word-pron{color:#94a3b8;}
         body.oa-widget-dark .oa-word-modal .oa-word-def{color:#cbd5e1;}
         body.oa-widget-dark .oa-word-modal .oa-btn-audio{background:#334155;border-color:#67e8f9;color:#67e8f9;}
         body.oa-widget-dark .oa-word-modal .oa-btn-audio:hover{background:#475569;}
@@ -269,6 +1216,9 @@
         .oa-panel-footer a:hover{text-decoration:underline;color:#67e8f9;}
         .oa-panel-footer .oa-account-badge{display:inline-block;margin-top:4px;padding:2px 8px;border-radius:6px;background:rgba(255,255,255,0.15);color:#e2e8f0;font-size:11px;}
         .oa-panel-footer .oa-account-badge-hidden{display:none;}
+        .oa-voice-nav-hint{margin:4px 0 0;font-size:12px;color:#64748b;}
+        .oa-btn-test-voice{margin-top:4px;}
+        body.oa-widget-dark .oa-voice-nav-hint{color:#94a3b8;}
       `;
       const el = document.createElement('style');
       el.id = id;
@@ -276,6 +1226,7 @@
       document.head.appendChild(el);
     }
   
+    // Inject SVG filters for color-blindness modes (protanopia, deuteranopia, tritanopia).
     function ensureSvgFilters() {
       let svg = document.getElementById('openaccessible-filters');
       if (svg) return;
@@ -295,7 +1246,6 @@
   
     // --- Apply current state to document (colors, font size, dyslexia font, etc.) ---
     function applyToDocument() {
-      ensureFontsInjected();
       if (!$root) $root = document.documentElement;
       $root.classList.add('openaccessible-widget-root');
       $root.style.setProperty('font-size', state.fontSize + '%');
@@ -306,7 +1256,7 @@
       if (state.colorFilter && state.colorFilter !== 'none') $root.classList.add('oa-color-' + state.colorFilter);
   
       $root.classList.toggle('oa-dyslexia', !!state.dyslexiaFont);
-      if (state.dyslexiaFont) ensureFontsInjected();
+      if (state.dyslexiaFont) loadDyslexiaFont();
       var panel = document.getElementById('openaccessible-panel');
       if (panel) panel.classList.toggle('oa-dyslexia', !!state.dyslexiaFont);
       $root.classList.toggle('oa-highlight-links', !!state.highlightLinks);
@@ -346,20 +1296,24 @@
       if (state.colorFilter === 'dark') document.body.classList.add('oa-widget-dark');
       if (state.colorFilter === 'light') document.body.classList.add('oa-widget-light');
       initLinkUrlOnFocus();
+      applyFormLabelHints($root);
     }
   
-    function ensureFontsInjected() {
-      if (document.getElementById('openaccessible-fonts')) return;
-      const base = getFontsBase();
-      const style = document.createElement('style');
-      style.id = 'openaccessible-fonts';
-      style.textContent =
-        '@font-face{font-family:"Ubuntu";src:url("' + base + 'Ubuntu-Regular.ttf") format("truetype");font-weight:400;font-style:normal;}' +
-        '@font-face{font-family:"OpenDyslexic";src:url("' + base + 'OpenDyslexic-Regular.otf") format("opentype");font-weight:400;font-style:normal;}';
-      document.head.appendChild(style);
+    // Load OpenDyslexic font stylesheet when dyslexia font is enabled.
+    function loadDyslexiaFont() {
+      if (document.getElementById('openaccessible-dyslexia-font')) return;
+      const link = document.createElement('link');
+      link.id = 'openaccessible-dyslexia-font';
+      link.rel = 'stylesheet';
+      link.href = 'https://fonts.cdnfonts.com/css/open-dyslexic';
+      link.onerror = function () {
+        document.documentElement.style.setProperty('--oa-dyslexia-font', '"Comic Sans MS", sans-serif');
+      };
+      document.head.appendChild(link);
     }
   
     // --- Sync panel controls (checkboxes, ranges, selects) from state ---
+    // Update all panel form controls to match current state (e.g. after load or reset).
     function syncPanelFromState() {
       if (!$panel) return;
       const get = (name) => $panel.querySelector(`[data-oa-opt="${name}"]`);
@@ -379,13 +1333,16 @@
       set('highlightHeadings', state.highlightHeadings);
       set('highlightFocus', state.highlightFocus);
       set('ttsEnabled', state.ttsEnabled);
+      set('ttsMuted', state.ttsMuted);
       set('ttsRate', state.ttsRate);
       set('ttsPitch', state.ttsPitch);
+      set('ttsVoice', state.ttsVoice);
       set('textAlign', state.textAlign);
       set('language', state.language);
       set('reduceMotion', state.reduceMotion);
       set('underlineLinks', state.underlineLinks);
       set('readingGuide', state.readingGuide);
+      set('voiceNavigationEnabled', state.voiceNavigationEnabled);
       set('toolbarPosition', state.toolbarPosition);
       set('dictionaryEnabled', state.dictionaryEnabled);
       set('screenReaderHints', state.screenReaderHints);
@@ -404,6 +1361,7 @@
       set('contentWidth', state.contentWidth);
     }
   
+    // Read panel form values into state, persist, apply to document, and sync voice nav.
     function applyFromPanel() {
       if (!$panel) return;
       const get = (name, asNumber) => {
@@ -422,13 +1380,16 @@
       state.highlightHeadings = get('highlightHeadings');
       state.highlightFocus = get('highlightFocus');
       state.ttsEnabled = get('ttsEnabled');
+      state.ttsMuted = get('ttsMuted');
       state.ttsRate = parseFloat(get('ttsRate', true)) || 1;
       state.ttsPitch = parseFloat(get('ttsPitch', true)) || 1;
+      state.ttsVoice = get('ttsVoice') || null;
       state.textAlign = get('textAlign') || '';
       state.language = get('language') || '';
       state.reduceMotion = get('reduceMotion');
       state.underlineLinks = get('underlineLinks');
       state.readingGuide = get('readingGuide');
+      state.voiceNavigationEnabled = get('voiceNavigationEnabled');
       state.toolbarPosition = get('toolbarPosition') || 'bottom-right';
       state.dictionaryEnabled = get('dictionaryEnabled');
       state.screenReaderHints = get('screenReaderHints');
@@ -448,11 +1409,13 @@
       writeStorage();
       applyToDocument();
       updateToolbarPosition();
+      ensureVoiceNavigation();
       syncApiPreferences('save');
       emit('change', state);
     }
   
     // --- Position floating toolbar (top/bottom left/right) ---
+    // Set toolbar and panel position from state.toolbarPosition.
     function updateToolbarPosition() {
       const pos = state.toolbarPosition || 'bottom-right';
       if ($panel) $panel.setAttribute('data-pos', pos);
@@ -460,6 +1423,7 @@
       if (tb) tb.setAttribute('data-pos', pos);
     }
   
+    // Set or clear the toolbar button active state (visual when panel is open).
     function updateToolbarActive(open) {
       const tb = document.getElementById('openaccessible-toolbar');
       const btn = tb && tb.querySelector('[data-oa-open]');
@@ -467,6 +1431,7 @@
     }
   
     // --- Build settings panel DOM (sections: Reading, Size, Highlight, TTS, Translate, etc.) ---
+    // Build the settings panel DOM (once), wire controls to state, fill voice list, add Test voice and voice nav.
     function createPanel() {
       if ($panel) return $panel;
       const pos = state.toolbarPosition || 'bottom-right';
@@ -592,6 +1557,10 @@
             <label for="oa-tts">Enable TTS</label>
           </div>
           <div class="oa-opt">
+            <input type="checkbox" data-oa-opt="ttsMuted" id="oa-tts-muted">
+            <label for="oa-tts-muted">Mute sound</label>
+          </div>
+          <div class="oa-opt">
             <input type="checkbox" data-oa-opt="highlightAsRead" id="oa-highlight-read">
             <label for="oa-highlight-read">Highlight words as you read</label>
           </div>
@@ -603,15 +1572,26 @@
             <label>Pitch</label>
             <input type="range" data-oa-opt="ttsPitch" min="0.5" max="2" step="0.1" value="1">
           </div>
-          <div class="oa-opt">
+          <div class="oa-opt oa-opt-voice-row">
             <label>Voice</label>
             <select data-oa-opt="ttsVoice"><option value="">Default</option></select>
+          </div>
+          <div class="oa-opt">
+            <button type="button" class="oa-btn-tts oa-btn-test-voice" data-oa-test-voice aria-label="Play sample with selected voice">Test voice</button>
           </div>
           <div class="oa-tts-actions">
             <button type="button" class="oa-btn-tts" data-oa-tts-read aria-label="Read page">Read</button>
             <button type="button" class="oa-btn-tts" data-oa-tts-stop aria-label="Stop">Stop</button>
             <button type="button" class="oa-btn-tts" data-oa-speak-selection aria-label="Speak selection">Speak selection</button>
           </div>
+        </div>
+        <div class="oa-section">
+          <div class="oa-section-title">Voice navigation</div>
+          <div class="oa-opt">
+            <input type="checkbox" data-oa-opt="voiceNavigationEnabled" id="oa-voice-nav">
+            <label for="oa-voice-nav">Enable voice commands (e.g. &quot;Open accessibility&quot;, &quot;Read page&quot;, &quot;Stop&quot;)</label>
+          </div>
+          <p class="oa-voice-nav-hint">Say: open/close accessibility, read page, stop, speak selection, next heading, show headings.</p>
         </div>
   
         <div class="oa-section">
@@ -673,8 +1653,17 @@
         </div>
   
         <div class="oa-section">
-          <div class="oa-section-title">Quick presets</div>
-          <div class="oa-tts-actions">
+          <div class="oa-section-title">Presets</div>
+          <div class="oa-preset-select-wrap">
+            <select data-oa-preset-select aria-label="Apply preset">
+              <option value="">Apply a preset…</option>
+              <option value="high-contrast">High contrast</option>
+              <option value="reading">Reading</option>
+              <option value="minimal">Minimal</option>
+              <option value="focus">Focus &amp; visibility</option>
+            </select>
+          </div>
+          <div class="oa-tts-actions" style="margin-top:8px">
             <button type="button" class="oa-btn-tts" data-oa-preset-spacing>More spacing</button>
             <button type="button" class="oa-btn-tts" data-oa-preset-contrast>High contrast</button>
           </div>
@@ -758,9 +1747,11 @@
           <div class="oa-tts-actions">
             <button type="button" class="oa-btn-tts" data-oa-export>Export settings</button>
             <button type="button" class="oa-btn-tts" data-oa-import>Import settings</button>
+            <button type="button" class="oa-btn-tts" data-oa-shortcuts aria-label="Keyboard shortcuts">Keyboard shortcuts</button>
+            <button type="button" class="oa-btn-tts" data-oa-about aria-label="About">About</button>
           </div>
           <input type="file" accept=".json,application/json" data-oa-import-file style="display:none">
-          <p class="oa-shortcut-hint" style="margin:8px 0 0;font-size:12px;color:#64748b;">Shortcut: Alt+A to open/close</p>
+          <p class="oa-shortcut-hint" style="margin:8px 0 0;font-size:12px;color:#64748b;">Keyboard: Windows Alt+A, Mac Option+A to open/close. Escape to close. Tab to move, Enter or Space to activate. In panel: R = Read page, S = Stop.</p>
         </div>
   
         <div class="oa-section">
@@ -783,12 +1774,34 @@
       $panel.querySelector('[data-oa-translate-page]').addEventListener('click', translatePage);
       $panel.querySelector('[data-oa-preset-spacing]').addEventListener('click', applyMoreSpacingPreset);
       $panel.querySelector('[data-oa-preset-contrast]').addEventListener('click', applyHighContrastPreset);
+      var presetSelect = $panel.querySelector('[data-oa-preset-select]');
+      if (presetSelect) {
+        presetSelect.addEventListener('change', function () {
+          var val = this.value;
+          if (val) { applyPreset(val); this.value = ''; }
+        });
+        function fillPresetSelect() {
+          var opts = presetSelect.querySelectorAll('option');
+          for (var i = opts.length - 1; i >= 1; i--) opts[i].remove();
+          getSavedPresets().forEach(function (p) {
+            var o = document.createElement('option');
+            o.value = p.id;
+            o.textContent = p.name;
+            presetSelect.appendChild(o);
+          });
+        }
+        fillPresetSelect();
+      }
       $panel.querySelector('[data-oa-headings]').addEventListener('click', showHeadingsOutline);
       $panel.querySelector('[data-oa-images]').addEventListener('click', showImageDescriptions);
       $panel.querySelector('[data-oa-export]').addEventListener('click', exportSettings);
       $panel.querySelector('[data-oa-import]').addEventListener('click', function () { $panel.querySelector('[data-oa-import-file]').click(); });
-      $panel.querySelector('[data-oa-import-file]').addEventListener('change', importSettingsFromFile);
-  
+$panel.querySelector('[data-oa-import-file]').addEventListener('change', importSettingsFromFile);
+      var shortcutsBtn = $panel.querySelector('[data-oa-shortcuts]');
+      if (shortcutsBtn) shortcutsBtn.addEventListener('click', showKeyboardShortcuts);
+      var aboutBtn = $panel.querySelector('[data-oa-about]');
+      if (aboutBtn) aboutBtn.addEventListener('click', showAbout);
+
       $panel.querySelectorAll('input, select').forEach(el => {
         el.addEventListener('change', applyFromPanel);
         el.addEventListener('input', function () {
@@ -806,20 +1819,53 @@
   
       const voiceSelect = $panel.querySelector('[data-oa-opt="ttsVoice"]');
       if (voiceSelect && global.speechSynthesis) {
+        // Populate voice dropdown: sort by language, group in optgroups, preserve selection
         function fillVoices() {
-          const voices = global.speechSynthesis.getVoices();
+          const voices = global.speechSynthesis.getVoices().slice();
           voiceSelect.innerHTML = '<option value="">Default</option>';
-          voices.forEach(v => {
-            const o = document.createElement('option');
-            o.value = v.name;
-            o.textContent = v.name + (v.lang ? ' (' + v.lang + ')' : '');
-            voiceSelect.appendChild(o);
+          if (voices.length === 0) return;
+          voices.sort(function (a, b) {
+            const la = (a.lang || '').toLowerCase();
+            const lb = (b.lang || '').toLowerCase();
+            if (la !== lb) return la.localeCompare(lb);
+            return (a.name || '').localeCompare(b.name || '');
+          });
+          const byLang = {};
+          voices.forEach(function (v) {
+            const lang = v.lang || 'other';
+            if (!byLang[lang]) byLang[lang] = [];
+            byLang[lang].push(v);
+          });
+          Object.keys(byLang).sort().forEach(function (lang) {
+            const group = document.createElement('optgroup');
+            group.label = lang;
+            byLang[lang].forEach(function (v) {
+              const o = document.createElement('option');
+              o.value = v.name;
+              o.textContent = v.name + (v.lang ? ' (' + v.lang + ')' : '');
+              group.appendChild(o);
+            });
+            voiceSelect.appendChild(group);
           });
           if (state.ttsVoice) voiceSelect.value = state.ttsVoice;
         }
         fillVoices();
         if (global.speechSynthesis.onvoiceschanged !== undefined) global.speechSynthesis.onvoiceschanged = fillVoices;
       }
+      var langSelect = $panel.querySelector('[data-oa-opt="language"]');
+      if (langSelect) {
+        langSelect.innerHTML = '';
+        langSelect.appendChild(buildLanguageOptions(true));
+        if (state.language) langSelect.value = state.language;
+      }
+      var translateSelect = $panel.querySelector('[data-oa-opt="translateTargetLang"]');
+      if (translateSelect) {
+        translateSelect.innerHTML = '';
+        translateSelect.appendChild(buildLanguageOptions(true));
+        if (state.translateTargetLang) translateSelect.value = state.translateTargetLang;
+      }
+      var testVoiceBtn = $panel.querySelector('[data-oa-test-voice]');
+      if (testVoiceBtn) testVoiceBtn.addEventListener('click', testVoice);
   
       syncPanelFromState();
       updateFooterAccountBadge();
@@ -827,6 +1873,7 @@
     }
   
     // --- Check OpenAccessible.com for valid account/token and show "Account linked" in footer ---
+    // Verify apiKey with account endpoint and set hasOpenAccessibleAccount for footer badge.
     function checkOpenAccessibleAccount() {
       if (!apiKey || !accountVerifyUrl) return;
       var url = accountVerifyUrl.replace(/\?.*$/, '') + (accountVerifyUrl.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(apiKey);
@@ -841,6 +1888,7 @@
         .catch(function () {});
     }
   
+    // Show or hide the "Account linked" badge in panel footer based on hasOpenAccessibleAccount.
     function updateFooterAccountBadge() {
       var badge = document.getElementById('oa-account-badge');
       if (!badge) return;
@@ -854,6 +1902,7 @@
     }
   
     // --- Floating toolbar (open panel button, position from state) ---
+    // Create the floating toolbar with single button to open/close panel (once per page).
     function createToolbar() {
       if (document.getElementById('openaccessible-toolbar')) return;
       const pos = state.toolbarPosition || 'bottom-right';
@@ -879,12 +1928,47 @@
       document.body.appendChild(bar);
     }
   
+    // Return list of focusable elements in the panel for keyboard nav and focus trap.
+    function getPanelFocusables(panel) {
+      if (!panel) return [];
+      var sel = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+      return Array.prototype.filter.call(panel.querySelectorAll(sel), function (el) { return el.offsetParent !== null || el === document.activeElement; });
+    }
+    // Trap focus inside panel (Tab wraps last→first, Shift+Tab first→last) and add R/S shortcuts for Read/Stop.
+    function setupPanelFocusTrap(panel) {
+      if (!panel || panel.getAttribute('data-oa-focus-trap') === 'true') return;
+      panel.setAttribute('data-oa-focus-trap', 'true');
+      panel.addEventListener('keydown', function (e) {
+        if (panel.style.display !== 'block') return;
+        var target = e.target;
+        var inInput = target && (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA');
+        if (e.key === 'Tab') {
+          var focusables = getPanelFocusables(panel);
+          if (focusables.length === 0) return;
+          var first = focusables[0];
+          var last = focusables[focusables.length - 1];
+          if (e.shiftKey) {
+            if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+          } else {
+            if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+          }
+          return;
+        }
+        if (!inInput && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          var k = e.key.toLowerCase();
+          if (k === 'r') { e.preventDefault(); readPageWithTTS(); return; }
+          if (k === 's') { e.preventDefault(); stopTTS(); return; }
+        }
+      });
+    }
+    // Show or hide the settings panel; focus first control when opening; update toolbar active state.
     function togglePanel(open) {
       const panel = document.getElementById('openaccessible-panel');
       if (!panel) createPanel();
       const p = document.getElementById('openaccessible-panel');
       if (open) {
         p.style.display = 'block';
+        setupPanelFocusTrap(p);
         syncPanelFromState();
         updateToolbarActive(true);
         const first = p.querySelector('.oa-close, [data-oa-opt]');
@@ -896,6 +1980,7 @@
       emit('panel', { open: !!open });
     }
   
+    // Reset all preferences to defaults, re-apply, and sync panel.
     function reset() {
       state = { ...defaultState };
       writeStorage();
@@ -907,6 +1992,7 @@
     }
   
     // --- TTS: split long text into chunks for server (sentence boundaries when possible) ---
+    // Split text into chunks of maxLen, breaking at sentence end when possible for natural server TTS.
     function chunkTextForTts(text, maxLen) {
       maxLen = maxLen || 500;
       const chunks = [];
@@ -929,8 +2015,15 @@
     }
   
     // --- TTS: play next chunk from server queue ---
+    // Play the next chunk in serverTtsQueue; respects mute and aborts; advances queue or emits tts:stop when done.
     function playNextServerTts() {
       if (serverTtsQueue.length === 0 || serverTtsAbort) {
+        serverTtsAudio = null;
+        emit('tts:stop', {});
+        return;
+      }
+      if (isTtsMuted()) {
+        serverTtsQueue.length = 0;
         serverTtsAudio = null;
         emit('tts:stop', {});
         return;
@@ -938,6 +2031,7 @@
       const text = serverTtsQueue.shift();
       requestServerTts(text, function (url) {
         if (serverTtsAbort) return;
+        if (isTtsMuted()) { serverTtsAudio = null; emit('tts:stop', {}); return; }
         if (!url) {
           playNextServerTts();
           return;
@@ -950,6 +2044,7 @@
     }
   
     // --- TTS: request audio URL from API (action=tts), then onUrl(url) or onUrl(null) ---
+    // Request server TTS for text; onUrl is called with the audio URL or null on failure.
     function requestServerTts(text, onUrl) {
       if (!apiBase || !text.trim()) { if (onUrl) onUrl(null); return; }
       const url = apiBase.replace(/\?.*$/, '') + '?action=tts';
@@ -974,7 +2069,36 @@
         .catch(function () { if (onUrl) onUrl(null); });
     }
   
+// True when user has muted sound; all TTS/audio should skip playback (Test voice is exempt).
+    function isTtsMuted() { return !!state.ttsMuted; }
+
+    // Ensure state.ttsVoice is current from panel (in case change event didn't fire).
+    function syncTtsVoiceFromPanel() {
+      if (!$panel) return;
+      const sel = $panel.querySelector('[data-oa-opt="ttsVoice"]');
+      if (sel) state.ttsVoice = (sel.value && sel.value.trim()) ? sel.value.trim() : null;
+    }
+
+    // Return the SpeechSynthesisVoice for state.ttsVoice, or null.
+    function getTtsVoiceObject() {
+      if (!global.speechSynthesis || !global.speechSynthesis.getVoices) return null;
+      syncTtsVoiceFromPanel();
+      if (!state.ttsVoice) return null;
+      const voices = global.speechSynthesis.getVoices();
+      return voices.find(function (x) { return x.name === state.ttsVoice; }) || null;
+    }
+
+    // Apply current TTS options (rate, pitch, lang, voice) to an utterance.
+    function applyTtsOptionsToUtterance(u) {
+      u.rate = state.ttsRate || 1;
+      u.pitch = state.ttsPitch || 1;
+      u.lang = state.language || document.documentElement.lang || 'en';
+      var v = getTtsVoiceObject();
+      if (v) u.voice = v;
+    }
+
     // --- TTS: stop all playback (server queue + browser SpeechSynthesis) ---
+    // Cancel server queue, stop any playing server audio, cancel SpeechSynthesis, close reading view.
     function stopTTS() {
       serverTtsAbort = true;
       serverTtsQueue = [];
@@ -988,8 +2112,10 @@
       emit('tts:stop', {});
     }
   
+    // Speak the text of element el (when TTS enabled or data-oa-tts-force); respects mute.
     function speakElement(el) {
       if (!state.ttsEnabled && !el.hasAttribute('data-oa-tts-force')) return;
+      if (isTtsMuted()) return;
       stopTTS();
       const text = (el.innerText || el.textContent || '').trim().slice(0, 5000);
       if (!text) return;
@@ -1000,15 +2126,15 @@
         playNextServerTts();
         return;
       }
-      if (!global.speechSynthesis) return;
+if (!global.speechSynthesis) return;
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = state.ttsRate || 1;
-      u.pitch = state.ttsPitch || 1;
-      u.lang = state.language || document.documentElement.lang || 'en';
+      applyTtsOptionsToUtterance(u);
       global.speechSynthesis.speak(u);
     }
-  
+
+    // Speak the current text selection; uses server TTS if configured, else SpeechSynthesis; respects mute.
     function speakSelection() {
+      if (isTtsMuted()) return;
       const sel = global.getSelection();
       const text = (sel && sel.toString() || '').trim();
       if (!text) {
@@ -1023,21 +2149,101 @@
         playNextServerTts();
         return;
       }
-      if (!global.speechSynthesis) return;
+if (!global.speechSynthesis) return;
       const u = new SpeechSynthesisUtterance(text.slice(0, 5000));
-      u.rate = state.ttsRate || 1;
-      u.pitch = state.ttsPitch || 1;
-      u.lang = state.language || document.documentElement.lang || 'en';
-      if (state.ttsVoice && global.speechSynthesis.getVoices) {
-        const v = global.speechSynthesis.getVoices().find(function (x) { return x.name === state.ttsVoice; });
-        if (v) u.voice = v;
-      }
+      applyTtsOptionsToUtterance(u);
       global.speechSynthesis.speak(u);
       emit('tts:start', {});
+    }
+
+    // Play a short sample with the currently selected voice/rate/pitch (ignores mute so user can preview).
+    function testVoice() {
+      if (!global.speechSynthesis) return;
+      global.speechSynthesis.cancel();
+      var sample = 'This is a sample of the selected voice.';
+      var u = new SpeechSynthesisUtterance(sample);
+      applyTtsOptionsToUtterance(u);
+      global.speechSynthesis.speak(u);
+    }
+  
+    // --- Voice navigation: SpeechRecognition commands ---
+    // Return SpeechRecognition constructor if available (Chrome, Edge, Safari); null otherwise.
+    function getSpeechRecognition() {
+      return global.SpeechRecognition || global.webkitSpeechRecognition || null;
+    }
+    // Stop listening and clear the recognition instance.
+    function stopVoiceNavigation() {
+      if (!voiceRecognition) return;
+      try { voiceRecognition.stop(); } catch (_) {}
+      voiceRecognition = null;
+      voiceRecognitionActive = false;
+    }
+    // Start continuous speech recognition; match transcript to commands (open/close, read page, stop, etc.).
+    function startVoiceNavigation() {
+      if (!state.voiceNavigationEnabled) { stopVoiceNavigation(); return; }
+      var Recognition = getSpeechRecognition();
+      if (!Recognition) return;
+      stopVoiceNavigation();
+      var rec = new Recognition();
+      rec.continuous = true;
+      rec.interimResults = false;
+      rec.lang = state.language || document.documentElement.lang || 'en';
+      // Map spoken phrases to actions (open/close panel, read page, stop, speak selection, headings)
+      rec.onresult = function (e) {
+        if (!e.results || e.results.length === 0) return;
+        var last = e.results[e.results.length - 1];
+        if (!last.isFinal) return;
+        var transcript = (last[0] && last[0].transcript) ? last[0].transcript.trim().toLowerCase() : '';
+        if (!transcript) return;
+        if (/open\s*(accessibility|panel|settings)?|show\s*(accessibility|panel|settings)?/.test(transcript)) {
+          togglePanel(true);
+          var tb = document.getElementById('openaccessible-toolbar');
+          var btn = tb && tb.querySelector('[data-oa-open]');
+          if (btn) btn.classList.add('active');
+          return;
+        }
+        if (/close\s*(accessibility|panel|settings)?|hide\s*(accessibility|panel|settings)?/.test(transcript)) {
+          togglePanel(false);
+          updateToolbarActive(false);
+          return;
+        }
+        if (/read\s*page|read\s*(the\s*)?page/.test(transcript)) { readPageWithTTS(); return; }
+        if (/stop|pause/.test(transcript)) { stopTTS(); return; }
+        if (/speak\s*selection|read\s*selection/.test(transcript)) { speakSelection(); return; }
+        if (/show\s*headings|headings\s*list/.test(transcript)) { showHeadingsOutline(); return; }
+        if (/next\s*heading|previous\s*heading/.test(transcript)) {
+          var headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+          var current = null;
+          for (var i = 0; i < headings.length; i++) {
+            if (headings[i] === document.activeElement || headings[i].contains(document.activeElement)) { current = i; break; }
+            if (document.activeElement && headings[i].compareDocumentPosition(document.activeElement) & Node.DOCUMENT_POSITION_CONTAINS) current = i;
+          }
+          if (current === null) current = -1;
+          var idx = /next/.test(transcript) ? current + 1 : current - 1;
+          if (idx >= 0 && idx < headings.length) headings[idx].focus();
+          return;
+        }
+      };
+      rec.onerror = function () {};
+      // Restart when browser ends the session (e.g. timeout) so listening continues while enabled
+      rec.onend = function () {
+        if (state.voiceNavigationEnabled && voiceRecognition === rec) {
+          try { rec.start(); } catch (_) {}
+        }
+      };
+      voiceRecognition = rec;
+      voiceRecognitionActive = true;
+      try { rec.start(); } catch (_) {}
+    }
+    // Start or stop voice navigation based on state.voiceNavigationEnabled (e.g. after panel change).
+    function ensureVoiceNavigation() {
+      if (state.voiceNavigationEnabled) startVoiceNavigation();
+      else stopVoiceNavigation();
     }
   
     let selectionBarEl = null;
     // --- Selection bar: Speak / Translate after user selects text ---
+    // Show floating bar with Speak and Translate at (x,y) for current selection.
     function showSelectionBar(x, y) {
       hideSelectionBar();
       const bar = document.createElement('div');
@@ -1050,6 +2256,7 @@
       document.body.appendChild(bar);
       selectionBarEl = bar;
     }
+    // Remove the selection bar from the DOM.
     function hideSelectionBar() {
       if (selectionBarEl && selectionBarEl.parentNode) selectionBarEl.remove();
       selectionBarEl = null;
@@ -1057,7 +2264,9 @@
   
     let readingViewEl = null;
     let readingViewWordSpans = [];
+    // Start reading the page with TTS (browser or server); respects mute; uses highlight-as-read view if enabled.
     function readPageWithTTS() {
+      if (isTtsMuted()) return;
       stopTTS();
       const text = (document.body.innerText || document.body.textContent || '').trim();
       if (!text) return;
@@ -1077,18 +2286,12 @@
       if (!global.speechSynthesis) return;
       ttsSynth = global.speechSynthesis;
       ttsUtterance = new SpeechSynthesisUtterance(toSpeak);
-      ttsUtterance.rate = state.ttsRate || 1;
-      ttsUtterance.pitch = state.ttsPitch || 1;
-      ttsUtterance.lang = state.language || document.documentElement.lang || 'en';
-      if (state.ttsVoice) {
-        const voices = ttsSynth.getVoices();
-        const v = voices.find(function (x) { return x.name === state.ttsVoice; });
-        if (v) ttsUtterance.voice = v;
-      }
+      applyTtsOptionsToUtterance(ttsUtterance);
       ttsSynth.speak(ttsUtterance);
       emit('tts:start', {});
     }
   
+    // Open the reading-view dialog and speak fullText with word-by-word highlighting.
     function openReadingViewAndSpeak(fullText) {
       const words = fullText.split(/\s+/).filter(Boolean);
       if (words.length === 0) return;
@@ -1097,7 +2300,7 @@
       wrap.className = 'oa-reading-view';
       wrap.setAttribute('role', 'dialog');
       wrap.setAttribute('aria-label', 'Reading view');
-      const html = ['<h4>Reading</h4><button type="button" class="oa-reading-view-close" aria-label="Close">Ã—</button><div class="oa-reading-content">'];
+      const html = ['<h4>Reading</h4><button type="button" class="oa-reading-view-close" aria-label="Close">×</button><div class="oa-reading-content">'];
       words.forEach(function (w, i) {
         html.push('<span class="oa-word" data-oa-widx="' + i + '">' + escapeHtml(w) + '</span> ');
       });
@@ -1108,13 +2311,7 @@
       readingViewEl = wrap;
       readingViewWordSpans = wrap.querySelectorAll('.oa-word');
       const u = new SpeechSynthesisUtterance(fullText);
-      u.rate = state.ttsRate || 1;
-      u.pitch = state.ttsPitch || 1;
-      u.lang = state.language || document.documentElement.lang || 'en';
-      if (state.ttsVoice && global.speechSynthesis.getVoices) {
-        const v = global.speechSynthesis.getVoices().find(function (x) { return x.name === state.ttsVoice; });
-        if (v) u.voice = v;
-      }
+      applyTtsOptionsToUtterance(u);
       u.onboundary = function (e) {
         if (e.name !== 'word' || readingViewWordSpans.length === 0) return;
         var idx = Math.min(Math.floor((e.charIndex / fullText.length) * words.length), words.length - 1);
@@ -1127,6 +2324,7 @@
       ttsUtterance = u;
       emit('tts:start', {});
     }
+    // Close the reading-view overlay and clear word spans.
     function closeReadingView() {
       if (readingViewEl && readingViewEl.parentNode) readingViewEl.remove();
       readingViewEl = null;
@@ -1138,6 +2336,7 @@
       return d.innerHTML;
     }
   
+    // Translate current selection to state.translateTargetLang and show in tooltip.
     function translateSelection() {
       const sel = global.getSelection();
       const text = (sel && sel.toString() || '').trim();
@@ -1152,40 +2351,149 @@
       });
     }
   
+    // Translate page body to state.translateTargetLang and show in overlay. Uses chunked translation for long text. *
     function translatePage() {
-      const text = (document.body.innerText || document.body.textContent || '').trim().slice(0, 8000);
+      const rawText = (document.body.innerText || document.body.textContent || '').trim();
+      const text = rawText.slice(0, 15000);
       if (!text) return;
       const lang = state.translateTargetLang || 'es';
       if (!lang) {
         showTooltip(null, 'Choose a language under Translate to, then click Translate page.');
         return;
       }
-      requestTranslate(text, lang, function (translated) {
-        if (!translated) { showTooltip(null, 'Translation failed.'); return; }
-        const overlay = document.createElement('div');
-        overlay.className = 'oa-translate-overlay';
-        overlay.setAttribute('role', 'dialog');
-        overlay.setAttribute('aria-label', 'Translated page');
-        overlay.innerHTML = '<h4>Translated page (' + lang + ')</h4><button type="button" class="oa-reading-view-close" aria-label="Close">Ã—</button><div class="oa-translated-text"></div>';
-        overlay.querySelector('.oa-translated-text').textContent = translated;
-        overlay.querySelector('.oa-reading-view-close').addEventListener('click', function () { overlay.remove(); });
-        document.body.appendChild(overlay);
-      });
-    }
-  
-    function requestTranslate(text, targetLang, onDone) {
-      if (!apiBase) {
-        onDone(null);
+      emit('translate:start', { lang: lang, length: text.length });
+      if (text.length <= TRANSLATE_CHUNK_MAX_CHARS) {
+        requestTranslate(text, lang, function (translated) {
+          showTranslatedPageOverlay(translated, lang);
+          emit('translate:done', { lang: lang });
+        });
         return;
       }
-      const url = apiBase.replace(/\?.*$/, '') + '?action=translate';
-      const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: text.slice(0, 5000), target: targetLang }) };
-      if (apiKey) opts.headers['X-API-Key'] = apiKey;
-      fetch(url, opts).then(function (r) { return r.json(); }).then(function (data) {
-        onDone(data && data.translated ? data.translated : null);
-      }).catch(function () { onDone(null); });
+      requestTranslateChunked(text, lang, function (translated) {
+        if (!translated) { showTooltip(null, 'Translation failed.'); emit('translate:done', { lang: lang, error: true }); return; }
+        showTranslatedPageOverlay(translated, lang);
+        emit('translate:done', { lang: lang });
+      });
+    }
+
+    // Show overlay with translated text and close button.
+    function showTranslatedPageOverlay(translated, lang) {
+      if (!translated) { showTooltip(null, 'Translation failed.'); return; }
+      const overlay = document.createElement('div');
+      overlay.className = 'oa-translate-overlay';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-label', 'Translated page');
+      overlay.innerHTML = '<h4>Translated page (' + lang + ')</h4><button type="button" class="oa-reading-view-close" aria-label="Close">×</button><div class="oa-translated-text"></div>';
+      overlay.querySelector('.oa-translated-text').textContent = translated;
+      overlay.querySelector('.oa-reading-view-close').addEventListener('click', function () { overlay.remove(); });
+      document.body.appendChild(overlay);
+    }
+
+    // Split text into chunks by sentences/paragraphs, translate each, concatenate. onDone(translatedText or null).
+    function requestTranslateChunked(text, targetLang, onDone) {
+      var sourceLang = (state.language || document.documentElement.lang || 'en').toLowerCase().slice(0, 2);
+      var chunks = splitTextIntoChunks(text, TRANSLATE_CHUNK_MAX_CHARS);
+      var results = [];
+      var index = 0;
+      function next() {
+        if (index >= chunks.length) {
+          onDone(results.join(''));
+          return;
+        }
+        var chunk = chunks[index];
+        requestTranslate(chunk, targetLang, function (translated) {
+          if (!translated) { onDone(null); return; }
+          results.push(translated);
+          index++;
+          next();
+        });
+      }
+      next();
+    }
+
+    // Split text into chunks preferring sentence/paragraph boundaries; max length per chunk.
+    function splitTextIntoChunks(text, maxLen) {
+      if (!text || maxLen < 1) return [];
+      if (text.length <= maxLen) return [text];
+      var chunks = [];
+      var rest = text;
+      while (rest.length > 0) {
+        if (rest.length <= maxLen) {
+          chunks.push(rest);
+          break;
+        }
+        var segment = rest.slice(0, maxLen);
+        var lastBreak = -1;
+        var re = TRANSLATE_CHUNK_SEPARATOR;
+        var m;
+        while ((m = re.exec(segment)) !== null) lastBreak = m.index + m[0].length;
+        if (lastBreak > 0) {
+          chunks.push(rest.slice(0, lastBreak).trim());
+          rest = rest.slice(lastBreak).trim();
+        } else {
+          var fallback = segment.length;
+          for (var i = segment.length - 1; i >= 0; i--) {
+            if (/[\s.,;:!?]/.test(segment[i])) { fallback = i + 1; break; }
+          }
+          chunks.push(rest.slice(0, fallback));
+          rest = rest.slice(fallback).trim();
+        }
+      }
+      return chunks;
     }
   
+// Request translation from API; onDone(translatedText or null). Tries translateApiUrl (LibreTranslate), then apiBase, then MyMemory.
+    function requestTranslate(text, targetLang, onDone) {
+      var sourceLang = (state.language || document.documentElement.lang || 'en').toLowerCase().slice(0, 2);
+      if (!targetLang) { onDone(null); return; }
+      var truncated = text.slice(0, 5000).trim();
+      if (!truncated) { onDone(null); return; }
+
+      function tryOssTranslate() {
+        if (!translateApiUrl) return tryBackend();
+        var url = translateApiUrl.replace(/\?.*$/, '');
+        var fetchOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ q: truncated, source: sourceLang, target: targetLang }) };
+        fetch(url, fetchOpts)
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(r); })
+          .then(function (data) {
+            if (data && data.translatedText != null) onDone(data.translatedText);
+            else tryBackend();
+          })
+          .catch(function () { tryBackend(); });
+      }
+
+      function tryBackend() {
+        if (!apiBase) return tryFreeApi();
+        var url = apiBase.replace(/\?.*$/, '') + '?action=translate';
+        var opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: truncated, target: targetLang }) };
+        if (apiKey) opts.headers['X-API-Key'] = apiKey;
+        fetch(url, opts)
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            if (data && data.translated) onDone(data.translated);
+            else tryFreeApi();
+          })
+          .catch(function () { tryFreeApi(); });
+      }
+
+      function tryFreeApi() {
+        var trim500 = truncated.slice(0, 500);
+        var pair = sourceLang + '|' + targetLang;
+        var url = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(trim500) + '&langpair=' + encodeURIComponent(pair);
+        fetch(url)
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            var t = data && data.responseData && data.responseData.translatedText;
+            if (t && data.responseStatus !== 403) onDone(t);
+            else onDone(null);
+          })
+          .catch(function () { onDone(null); });
+      }
+
+      tryOssTranslate();
+    }
+  
+    // Apply preset: wider letter/line/word spacing.
     function applyMoreSpacingPreset() {
       state.letterSpacing = 'wide';
       state.lineHeight = 'relaxed';
@@ -1196,6 +2504,7 @@
       syncApiPreferences('save');
     }
   
+    // Apply preset: dark color filter, higher contrast, focus highlights.
     function applyHighContrastPreset() {
       state.colorFilter = 'dark';
       state.contrast = 1.3;
@@ -1207,6 +2516,7 @@
       syncApiPreferences('save');
     }
   
+    // Show overlay listing all h1–h6 with links to scroll to each.
     function showHeadingsOutline() {
       var headings = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
       if (headings.length === 0) {
@@ -1217,7 +2527,7 @@
       overlay.className = 'oa-translate-overlay';
       overlay.setAttribute('role', 'dialog');
       overlay.setAttribute('aria-label', 'Page headings');
-      var html = ['<h4>Headings</h4><button type="button" class="oa-reading-view-close" aria-label="Close">Ã—</button><ul class="oa-overlay-list">'];
+      var html = ['<h4>Headings</h4><button type="button" class="oa-reading-view-close" aria-label="Close">×</button><ul class="oa-overlay-list">'];
       headings.forEach(function (h, i) {
         var tag = h.tagName.toLowerCase();
         var text = (h.textContent || '').trim().slice(0, 80);
@@ -1240,6 +2550,7 @@
       document.body.appendChild(overlay);
     }
   
+    // Show overlay listing all images with their alt text (or placeholder).
     function showImageDescriptions() {
       var imgs = document.querySelectorAll('img');
       var list = [];
@@ -1256,7 +2567,7 @@
       overlay.className = 'oa-translate-overlay';
       overlay.setAttribute('role', 'dialog');
       overlay.setAttribute('aria-label', 'Image descriptions');
-      var html = ['<h4>Image descriptions</h4><button type="button" class="oa-reading-view-close" aria-label="Close">Ã—</button><ul class="oa-overlay-list">'];
+      var html = ['<h4>Image descriptions</h4><button type="button" class="oa-reading-view-close" aria-label="Close">×</button><ul class="oa-overlay-list">'];
       list.forEach(function (item) {
         html.push('<li>' + escapeHtml(item.alt) + ' <span style="font-size:11px;color:#94a3b8;">' + escapeHtml(item.src) + '</span></li>');
       });
@@ -1266,6 +2577,7 @@
       document.body.appendChild(overlay);
     }
   
+    // Export current state as JSON file download.
     function exportSettings() {
       var blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
       var a = document.createElement('a');
@@ -1276,6 +2588,7 @@
       showTooltip(null, 'Settings exported.');
     }
   
+    // Read selected JSON file and merge into state; re-apply and sync panel.
     function importSettingsFromFile(e) {
       var file = e.target.files[0];
       if (!file) return;
@@ -1299,11 +2612,13 @@
       r.readAsText(file);
     }
   
+    // Attach or remove focusin listener for showing link URL in tooltip when showLinkUrl is on.
     function initLinkUrlOnFocus() {
       document.body.removeEventListener('focusin', onLinkFocusIn);
       if (!state.showLinkUrl) return;
       document.body.addEventListener('focusin', onLinkFocusIn);
     }
+    // On focus of a link, show its href in a tooltip after short delay.
     function onLinkFocusIn(e) {
       if (!state.showLinkUrl) return;
       var target = e.target;
@@ -1317,6 +2632,7 @@
   
     // --- Dictionary: double-click word -> fetch definition (API or local) -> show word modal with audio ---
     var dictionaryListenerAttached = false;
+    // Attach dblclick listener once: on double-clicked word, fetch definition and show modal with Play word/definition.
     function initDictionary() {
       if (dictionaryListenerAttached) return;
       dictionaryListenerAttached = true;
@@ -1335,24 +2651,25 @@
             .then(function (r) { return r.json(); })
             .then(function (d) {
               var def = (d && d.definition) ? d.definition : (getLocalDefinition(text) || 'No definition found.');
-              var pron = (d && (d.pronunciation || d.how_to_say)) ? (d.pronunciation || d.how_to_say) : null;
-              showWordModal(text, def, pron);
+              showWordModal(text, def);
             })
             .catch(function () {
-              showWordModal(text, getLocalDefinition(text) || 'Definition not available.', null);
+              showWordModal(text, getLocalDefinition(text) || 'Definition not available.');
             });
         } else {
-          showWordModal(text, getLocalDefinition(text) || 'Double-click a word for definition. Set API for more words.', null);
+          showWordModal(text, getLocalDefinition(text) || 'Double-click a word for definition. Set API for more words.');
         }
       });
     }
-    // Fallback when no API: built-in dictionary (2000 words)
-    var LOCAL_DICT_STR = 'word|definition\naccessibility|Making something usable by people with disabilities.\ncontrast|Difference in brightness between text and background.\ndyslexia|A condition that can make reading and spelling harder.\nread|To look at and understand written text.\ntext|Written or printed words.\nspeech|Spoken language; also a feature that reads text aloud.\nhighlight|To mark something so it stands out.\ncursor|The on-screen pointer you move with the mouse.\nfont|A set of letters and symbols in one style.\nsize|How big or small something is.\npage|A single side of a sheet of paper or a web document.\nlink|A clickable connection to another page or resource.\nbutton|A control you click to perform an action.\nhelp|Support or assistance.\ndictionary|A reference list of words and their meanings.\nthe|Used to refer to something already mentioned.\nand|Connects words or phrases.\nwidget|A small control or application on a screen.\nsettings|Options that control how something works.\ntranslate|To change text from one language to another.\nlanguage|A system of words and grammar used to communicate.\nspeak|To say something using your voice.\nlisten|To pay attention to sound or what someone says.\nopen|Not closed; or to start or reveal something.\nclose|To shut; or near in distance.\nmenu|A list of options to choose from.\noption|One thing you can choose.\nclick|To press a button on a mouse or screen.\nselect|To choose something.\nfocus|To give attention to; or the element that receives input next.\nscreen|The display that shows images and text.\nreader|Someone or something that reads; a screen reader helps people hear content.\ndefinition|A clear and precise explanation of the meaning of a word.\nmore|Additional; a greater amount.\nreset|To set back to the original or default state.\nstop|To end or cause to end.\nvoice|The sound a person makes when speaking; or a TTS voice option.\nrate|Speed; how fast something happens.\npitch|How high or low a sound is.\nfilter|A setting that changes how colors or content appear.\ngrayscale|Shades of gray only; no color.\ninvert|To reverse or turn inside out; e.g. dark becomes light.\nsepia|A brownish tone often used for old-style photos.\ntheme|A set of colors and styles applied to the interface.\ndark|With little or no light; dark mode uses dark backgrounds.\nlight|With brightness; light mode uses light backgrounds.\nzoom|To make content appear larger or smaller.\nlarge|Big; of great size.\nsmall|Little; of limited size.\nnormal|Usual; not changed or special.\nwide|Broad; covering a large distance from side to side.\nspacing|The amount of space between letters or lines.\nletter|A character used in writing; e.g. A or b.\nline|A row of text; or a straight mark.\nrelaxed|At ease; here, more space between lines for easier reading.\nloose|Not tight; here, even more space between lines.\nheading|A title or label for a section of content.\nunderline|A line drawn under text for emphasis.\nmotion|Movement; animation.\nreduce|To make less or smaller.\nguide|Something that shows the way; the reading guide highlights a band of text.\ntoolbar|A strip of buttons or controls on screen.\nposition|Where something is placed; e.g. top or bottom of the screen.\nexport|To save or download data to a file.\nimport|To load or bring in data from a file.\nkeyboard|The set of keys used to type; keyboard shortcut is a key combination.\nshortcut|A quick way to do something, e.g. a key combination.\npreset|A saved set of options applied with one action.\nnavigation|Moving through content; e.g. headings or links.\nimage|A picture or graphic.\ndescription|Words that explain what something is or shows.\nalt|Short for alternative; alt text describes an image for screen readers.\nform|A set of fields where you enter information.\nfield|A place to type or select one piece of information.\nlabel|Text that names or describes a control or field.\ncontent|The text and media that make up a page.\nwidth|How wide something is from side to side.\nnarrow|Not wide; limited width for easier reading.\nfull|Complete; using the whole space.\nlayout|The way things are arranged on a page.\nvisibility|Whether and how well something can be seen.\ntransparency|How see-through something is; reduce transparency means more solid colors.\nindicator|Something that shows a state; e.g. focus indicator shows what is selected.\nbraille|A system of raised dots read by touch; used by some people who are blind.\nskip|To pass over; skip link jumps to main content.\nmain|Most important; main content is the primary part of the page.\ndemo|A short example or demonstration.\nfeature|A function or capability of a product.\nembed|To place something inside a page; e.g. embed the widget.\npreference|A setting or choice you save.\nsave|To store for later use.\nload|To bring in or restore saved data.\ndefault|The starting or usual value when nothing is changed.\ncustom|Made to suit you; customized.\ncolor|The hue or shade of something; e.g. red or blue.\nblind|Unable to see; some users rely on screen readers or Braille.\ndeuteranopia|A type of color blindness affecting green vision.\nprotanopia|A type of color blindness affecting red vision.\ntritanopia|A type of color blindness affecting blue vision.\ngreeting|A word or phrase used when meeting or addressing someone.\nhello|A greeting or way to say hi.\nworld|The earth and all people and things on it.\nexample|Something that shows how something works.\nsection|A part or division of a page or document.\nlist|A series of items shown one after another.\nitem|One thing in a group or list.\nnext|The one that comes after.\nprevious|The one that came before.\nfirst|Coming before all others.\nlast|Coming after all others.\nstart|To begin.\nbegin|To start.\nend|To finish; or the final part.\nfinish|To complete or end.\ncontinue|To keep going.\ncancel|To stop and not complete an action.\nconfirm|To agree or say yes to something.\nsubmit|To send a form or request.\nsend|To cause something to go to another place or person.\nreceive|To get something that was sent.\nerror|Something that went wrong; an error message explains the problem.\nsuccess|When something worked as intended.\nwarning|A message that something might be wrong or risky.\nnotice|A message or piece of information for the user.\nmessage|Words sent or shown to communicate something.\ntitle|The name of a page or document.\nname|What something or someone is called.\nsearch|To look for something by typing or choosing terms.\nfind|To discover or locate something.\nshow|To make something visible.\nhide|To make something not visible.\nenable|To turn on or allow.\ndisable|To turn off or prevent.\non|Active; enabled.\noff|Not active; disabled.\ncheck|To mark as selected; or to verify.\nuncheck|To remove a check; to deselect.\ntoggle|To switch between two states; e.g. on and off.\nincrease|To make larger or more.\ndecrease|To make smaller or less.\nadjust|To change slightly to improve.\nslider|A control you drag to set a value, e.g. volume or size.\ndropdown|A list that appears when you click; you pick one option.\ncheckbox|A control you check or uncheck for yes or no.\nradio|A control where you pick one option from several.\ninput|A place where you type or enter data.\noutput|What is produced or shown as a result.\nresult|What you get from an action or search.\ninformation|Facts or details about something.\ndetail|A small part of the whole; more specific information.\nsimple|Easy to understand or use.\ncomplex|Having many parts; not simple.\nclear|Easy to understand; or to remove.\nsupport|Help or assistance; or to hold up.\nassist|To help.\nease|Lack of difficulty; to make easier.\neasy|Not hard to do or understand.\nhard|Difficult; or firm to the touch.\ndifficult|Not easy.\nunderstand|To grasp the meaning of something.\nmeaning|What something is intended to express.\nintend|To mean or plan to do.\nexplain|To make clear with words.\ndescribe|To say what something is like.\nabout|Concerning; on the subject of.\nabove|Higher than; over.\nbelow|Lower than; under.\nafter|Following in time or order.\nbefore|Earlier than; in front of.\nagain|One more time; once more.\nalways|At all times; every time.\nnever|Not ever; at no time.\noften|Many times; frequently.\nsometimes|From time to time; not always.\nusually|Normally; in most cases.\nhere|In this place.\nthere|In that place.\nwhere|At or in what place.\nwhen|At what time.\nwhy|For what reason.\nhow|In what way; by what means.\nwhat|Which thing or things.\nwhich|Used to ask about one or more from a set.\nwho|What or which person.\nwhom|The person that; used as object.\nwhose|Belonging to which person.\nother|Different from the one mentioned.\nanother|One more; a different one.\neach|Every one of two or more, considered separately.\nevery|All of a group; each one.\nall|The whole amount or number.\nsome|An unspecified amount or number.\nmany|A large number of.\nfew|A small number of.\nmost|The greatest amount or number.\nleast|The smallest amount or number.\nnumber|A count or quantity; e.g. 1 or 2.\namount|How much there is of something.\nway|A method or direction; how something is done.\nplace|A location or position.\ntime|Seconds, minutes, hours; or an occasion.\nday|A period of 24 hours.\nweek|A period of seven days.\nmonth|A period of about 30 days.\nyear|A period of 12 months.\ntoday|This present day.\ntomorrow|The day after today.\nyesterday|The day before today.\nnow|At the present time.\nthen|At that time; next.\nsoon|In a short time.\nlater|After the present time.\nearly|Before the usual or expected time.\nlate|After the usual or expected time.\nquick|Fast; done in a short time.\nslow|Not fast; taking a long time.\nfast|Moving or happening quickly.\nnew|Recently made or begun; not old.\nold|Having existed for a long time.\ngood|Of high quality; satisfactory.\nbad|Of poor quality; not good.\nbetter|Of higher quality; improved.\nbest|Of the highest quality.\ngreat|Very good; large in size or importance.\nhigh|Far above the ground or average.\nlow|Near the ground or below average.\nright|Correct; or the opposite of left.\nleft|The side opposite right; or past tense of leave.\nwrong|Not correct; mistaken.\ntrue|In accordance with fact; real.\nfalse|Not true; incorrect.\nyes|Used to agree or confirm.\nno|Used to refuse or deny.\nplease|Used to make a request polite.\nthanks|An expression of gratitude.\nthank|To express gratitude.\nwelcome|Received with pleasure; or you\'re welcome as a response to thanks.\nsorry|Used to apologize or express regret.\nback|The rear; or to return.\nforward|Toward the front; or to send on.\nup|Toward a higher position.\ndown|Toward a lower position.\nin|Inside; within.\nout|Outside; not in.\nover|Above; covering.\nunder|Below; beneath.\nthrough|From one end to the other; by means of.\nbetween|In the space that separates two things.\namong|In the middle of; surrounded by.\nwith|In the company of; using.\nwithout|Not having; lacking.\nfrom|Starting at; originating in.\ninto|To the inside of.\nonto|On top of; to the surface of.\nduring|Throughout the course of.\nuntil|Up to the time that.\nwhile|During the time that.\nbecause|For the reason that.\nalthough|Even though; in spite of.\nhowever|Nevertheless; but.\ntherefore|For that reason; so.\nalso|In addition; too.\ntoo|As well; more than enough.\nonly|Just; no more than.\njust|Exactly; only; very recently.\neven|Equal; or used for emphasis.\nstill|Up to now; not moving.\nalready|Before now; by this time.\nyet|Up until now; still.\nonce|One time; formerly.\ntwice|Two times.\neverywhere|In every place.\nnowhere|In no place.\nsomething|An unspecified thing.\nanything|Any thing at all.\nnothing|Not anything.\neverything|All things.\nsomeone|An unspecified person.\nanyone|Any person.\nnoone|No person; nobody.\neveryone|Every person; everybody.\nthing|An object, idea, or event.\nperson|A human being.\npeople|Human beings; persons.\npart|A piece or section of a whole.\nkind|Type; sort.\nsort|Type; kind.\ntype|A category or class.\ngroup|A set of people or things together.\nset|A collection of things that belong together.\npiece|A part of something.\nbit|A small piece or amount.\nlot|A large amount or number.\nwhole|All of something; complete.\nhalf|One of two equal parts.\nthird|One of three equal parts.\nquarter|One of four equal parts.\npercent|Out of one hundred; e.g. 50 percent is half.\npoint|A dot; or a single idea or fact.\nstep|One of a series of actions; or a stage in a process.\nlevel|A position or stage; or how flat something is.\norder|Sequence; or a request for goods.\nchange|To make or become different.\ndifferent|Not the same; other.\nsame|Identical; not different.\nsimilar|Alike; almost the same.\nown|Belonging to oneself.\nturn|To rotate; or one\'s chance to do something.\ntry|To attempt; to make an effort.\nattempt|To try to do something.\nneed|To require; something necessary.\nwant|To wish for; to desire.\nlike|To enjoy; similar to.\nlove|To feel strong affection for.\nknow|To have information or understanding.\nthink|To use the mind; to believe.\nbelieve|To accept as true.\nfeel|To experience an emotion or sensation.\nremember|To keep in mind; to recall.\nforget|To fail to remember.\nlearn|To gain knowledge or skill.\nteach|To help someone learn.\nwork|To do a job; or a task or job.\nplay|To have fun; or a drama or game.\ngo|To move or travel.\ncome|To move toward here.\nleave|To go away from.\narrive|To reach a place.\nreturn|To come or go back.\nenter|To go or come in.\nexit|To go out; or a way out.\nadd|To put with something else; to combine.\nremove|To take away.\ndelete|To remove or erase.\ncopy|To duplicate; a duplicate.\npaste|To insert copied content.\ncut|To divide or remove with a sharp edge.\nundo|To reverse the last action.\nredo|To do again what was undone.\nrefresh|To load again; to update the page.\nreload|To load the page again.\ndownload|To copy from the internet to your device.\nupload|To send from your device to the internet.\ninstall|To set up software for use.\nupdate|To make current; to improve with new data.\nversion|A particular form or release of something.\ncurrent|Present; up to date.\nlatest|Most recent.\nolder|More old; previous version.\nnewer|More new; more recent.\ncreate|To make or bring something into existence.\nedit|To change or correct text or content.\nview|To look at or see; or a way of displaying something.\nshare|To let others see or use something.\nprint|To produce a paper copy; or to output.\nfolder|A place to store files or other items.\nfile|A document or set of data with a name.\ndocument|A piece of writing or a file with content.\nbrowser|A program used to view web pages.\nwebsite|A set of pages on the internet.\ninternet|A global network that connects computers.\nemail|Messages sent electronically.\npassword|A secret code used to sign in.\naccount|A record that lets you use a service.\nsignin|To enter your account.\nsignout|To leave your account.\nprofile|Information about a user.\nnotification|A message that alerts you.\nalert|A warning or notice.\npopup|A window that appears on top.\ntab|A separate page in a browser.\nscroll|To move content up or down.\nexpand|To make larger or show more.\ncollapse|To hide or make smaller.\nattach|To add a file to a message.\nreply|To respond to a message.\ninbox|Where received messages appear.\ntrash|Where deleted items go.\ndirectory|A container for files or folders.\npermission|Right to do or see something.\nprivacy|Keeping your information safe.\nsecurity|Protection from harm or unauthorized access.\nbackup|A copy kept for safety.\nrestore|To bring back from a backup.\nsync|To keep data the same across devices.\ndevice|A computer, phone, or other machine.\napp|A program or application.\nicon|A small picture that represents something.\ndesktop|The main screen on a computer.\nwindow|A separate area on the screen.\nminimize|To shrink a window to the taskbar.\nmaximize|To make a window full size.\npointer|The on-screen arrow you move.\nscrollbar|A bar you drag to scroll.\ntooltip|A short hint that appears on hover.\nhover|To hold the pointer over something.\ndrag|To move something by clicking and moving.\ndrop|To release after dragging.\ndouble-click|To press the mouse button twice quickly.\nright-click|To press the right mouse button.\nkey|A button on the keyboard.\nspacebar|The long key that types a space.\nshift|A key used for capital letters.\ncontrol|A key used with others for shortcuts.\nescape|A key that cancels or closes.\narrow|A key that moves the cursor.\nhome|The key that goes to the start.\nbold|Dark, thick text for emphasis.\nitalic|Slanted text for emphasis.\nstrikethrough|A line through text.\nbullet|A dot or symbol before a list item.\nnumbered|Having numbers in order.\nindent|To move text inward.\nalign|To line up text.\nparagraph|A block of text.\nsentence|A complete thought in words.\nability|The power or skill to do something.\nable|Having the power or skill to do something.\naccept|To agree to take or receive.\nachieve|To reach a goal or succeed.\naction|Something done; a deed.\nactive|Doing something; in use.\nactivity|Something you do; movement.\nactual|Real; existing in fact.\naddress|A location or place; or to speak to.\nadult|A grown-up person.\nadvance|To move forward; progress.\nadvantage|A benefit or gain.\nadvice|Suggestions about what to do.\naffect|To have an effect on.\nafford|To have enough money or time.\nafraid|Feeling fear.\nafternoon|The time between noon and evening.\nagainst|In opposition to.\nage|How old someone or something is.\nagency|An organization that does something.\nagent|A person or thing that acts.\nago|In the past.\nagree|To have the same opinion.\nagreement|When people agree.\nahead|In front; forward.\naim|A goal; or to point at.\nair|The gas we breathe.\nalbum|A collection of songs or photos.\nallow|To let someone do something.\nalmost|Nearly; not quite.\nalone|Without others.\nalong|From one end to the other.\namazing|Very surprising or good.\nanalysis|A careful study of something.\nanalyze|To study something carefully.\nanimal|A living thing that can move.\nannounce|To say something publicly.\nannual|Once a year.\nanswer|A reply; or to reply.\nanxious|Worried or nervous.\nany|One or some.\nanybody|Any person.\nanyway|In any case.\nanywhere|In any place.\napart|Separate; away from.\napartment|A set of rooms to live in.\napparent|Easy to see; clear.\nappear|To be seen; to show up.\nappearance|The way something looks.\napplication|A form or program.\napply|To put on or request.\nappointment|A set time to meet.\nappreciate|To be grateful for.\napproach|To come near; or a way of doing.\nappropriate|Right for the situation.\napprove|To agree to; to allow.\narea|A region or space.\nargue|To disagree with reasons.\nargument|A reason or disagreement.\narise|To happen; to get up.\narm|The body part from shoulder to hand.\naround|On all sides; about.\narrange|To put in order.\narrangement|The way things are ordered.\narrival|The act of arriving.\nart|Paintings, music, or creative work.\narticle|A piece of writing.\nartist|A person who makes art.\nartistic|Related to art; creative.\nas|In the role of; when.\nask|To put a question.\naspect|One part or side of something.\nassess|To judge or evaluate.\nassessment|A judgment or evaluation.\nasset|Something of value.\nassign|To give a task or role.\nassignment|A task given to someone.\nassistance|Help; support.\nassistant|A person who helps.\nassociate|To connect; or a partner.\nassociation|A group or connection.\nassume|To suppose; to take on.\nassumption|Something assumed.\nassure|To make sure; to promise.\nat|In a place or time.\natmosphere|The air or mood.\nattack|To try to harm; or an act of harm.\nattend|To be present at.\nattention|Focus; notice.\nattitude|A way of thinking or feeling.\nattract|To draw toward.\nattractive|Pleasing to look at.\naudience|People who watch or listen.\nauthor|A person who writes.\nauthority|Power or right to decide.\nautomatic|Working by itself.\navailable|Ready to use or get.\naverage|The usual amount; ordinary.\navoid|To keep away from.\naward|A prize; or to give a prize.\naware|Knowing about.\nawareness|Knowledge of something.\naway|Not here; at a distance.\nbaby|A very young child.\nbackground|The area behind; past experience.\nbag|A container to carry things.\nbalance|To keep steady; or equality.\nball|A round object used in games.\nband|A group of musicians.\nbank|A place to keep money.\nbar|A long piece; or a place that serves drinks.\nbase|The bottom or starting point.\nbasic|Simple; fundamental.\nbasis|The foundation or reason.\nbattle|A fight or struggle.\nbe|To exist; to have a quality.\nbear|To carry; to tolerate.\nbeat|To hit again and again; to defeat.\nbeautiful|Very pleasing to see.\nbeauty|The quality of being beautiful.\nbecome|To grow to be.\nbed|A place to sleep.\nbedroom|A room for sleeping.\nbeer|An alcoholic drink.\nbeginning|The start.\nbehavior|The way someone acts.\nbehind|At the back of.\nbeing|A living thing; existence.\nbelief|Something believed.\nbell|Something that rings.\nbelong|To be part of.\nbelt|A strip worn around the waist.\nbench|A long seat.\nbend|To curve or fold.\nbeneath|Under.\nbenefit|An advantage; or to gain.\nbeside|Next to.\nbesides|In addition to.\nbet|To risk money on a result.\nbeyond|On the other side of.\nbid|To offer a price.\nbig|Large in size.\nbill|Money owed; or a proposed law.\nbird|An animal with feathers that flies.\nbirth|When a baby is born.\nbirthday|The day someone was born.\nbite|To cut with teeth.\nblack|The color of coal.\nblame|To say someone is responsible.\nblank|Empty; with nothing written.\nblock|To stop; or a solid piece.\nblood|The red liquid in the body.\nblow|To move air.\nblue|The color of the sky.\nboard|A flat piece of wood; a group.\nboat|A vehicle that floats on water.\nbody|The physical form of a person.\nbone|The hard part inside the body.\nbook|Written pages bound together.\nborder|The edge or boundary.\nboring|Not interesting.\nborn|Brought into life.\nborrow|To take with permission to return.\nboss|The person in charge.\nboth|The two together.\nbother|To trouble or annoy.\nbottle|A container with a narrow neck.\nbottom|The lowest part.\nboundary|A line that divides.\nbowl|A round dish.\nbox|A container with sides.\nboy|A male child.\nbrain|The organ that thinks.\nbranch|A part of a tree; a division.\nbrand|A name for a product.\nbread|Food made from flour.\nbreak|To separate into pieces.\nbreakfast|The first meal of the day.\nbreast|The chest area.\nbreath|Air taken in and out.\nbreathe|To take air in and out.\nbridge|A structure over water or a gap.\nbrief|Short in time.\nbright|Giving much light.\nbrilliant|Very bright or clever.\nbring|To carry here.\nbroad|Wide.\nbroadcast|To send by radio or TV.\nbrother|A male sibling.\nbrown|A dark color like earth.\nbrush|To clean or paint with a tool.\nbudget|A plan for spending money.\nbuild|To make by putting parts together.\nbuilder|A person who builds.\nbuilding|A structure with walls and roof.\nburn|To be on fire.\nbus|A large vehicle for many passengers.\nbusiness|Buying and selling; a company.\nbusy|Having much to do.\nbut|However; except.\nbutter|A yellow spread from cream.\nbuy|To get by paying.\nbuyer|A person who buys.\nby|Near; through the action of.\ncabinet|A piece of furniture with doors.\ncake|A sweet baked food.\ncall|To speak to; to name.\ncalm|Peaceful; not excited.\ncamera|A device that takes photos.\ncamp|To stay in a tent.\ncampaign|A planned series of actions.\ncan|To be able to.\ncancer|A serious disease.\ncandidate|A person who might be chosen.\ncap|A hat; or a lid.\ncapability|The ability to do something.\ncapable|Able to do something.\ncapacity|The amount something can hold.\ncapital|A city that is the seat of government.\ncapture|To catch or record.\ncar|A vehicle with wheels.\ncard|A piece of stiff paper.\ncare|Attention; or to look after.\ncareer|A job or profession over time.\ncareful|Taking care.\ncarefully|In a careful way.\ncarry|To take from one place to another.\ncase|An instance; a container.\ncash|Money in coins or notes.\ncast|To throw; actors in a show.\ncat|A small furry animal.\ncatch|To grab; to get.\ncategory|A class or group.\ncause|To make happen; a reason.\ncell|A small room; a unit of life.\ncenter|The middle.\ncentral|In or of the center.\ncentury|A period of 100 years.\nceremony|A formal event.\ncertain|Sure; particular.\ncertainly|Without doubt.\nchain|A series of connected links.\nchair|A seat with a back.\nchairman|The person in charge of a meeting.\nchallenge|Something difficult; or to dare.\nchampion|A winner.\nchance|Luck; an opportunity.\nchannel|A TV station; a path.\nchapter|A section of a book.\ncharacter|A letter; a person in a story.\ncharge|To ask for payment; to accuse.\ncharity|Help for those in need.\nchart|A graph or map.\ncheese|A food made from milk.\nchemical|A substance used in chemistry.\nchest|The front of the body.\nchief|Most important; leader.\nchild|A young person.\nchoice|The act of choosing.\nchoose|To pick.\nchurch|A building for worship.\ncircle|A round shape.\ncircumstance|A condition or fact.\ncitizen|A person who belongs to a country.\ncity|A large town.\ncivil|Relating to citizens.\nclaim|To say something is true.\nclass|A group; a lesson.\nclassic|Of the highest quality.\nclassroom|A room for teaching.\nclean|Not dirty.\nclearly|In a clear way.\nclient|A customer.\nclimate|The weather over time.\nclimb|To go up.\nclock|A device that shows time.\nclosed|Shut; not open.\nclothes|Things worn on the body.\ncloud|White or gray mass in the sky.\nclub|A group or organization.\ncoach|A person who trains others.\ncoal|Black fuel from the ground.\ncode|A system of rules or symbols.\ncoffee|A drink made from beans.\ncold|Low in temperature.\ncolleague|A person you work with.\ncollect|To gather together.\ncollection|A group of things gathered.\ncollege|A place of higher learning.\ncolumn|A vertical section.\ncombination|A mix of things.\ncombine|To mix together.\ncomedy|Something funny.\ncomfort|Ease; or to ease.\ncomfortable|At ease.\ncommand|An order; or to order.\ncomment|A remark; or to remark.\ncommercial|Related to business.\ncommission|A group or a fee.\ncommit|To do; to promise.\ncommitment|A promise or dedication.\ncommittee|A group that decides.\ncommon|Shared; usual.\ncommunicate|To share information.\ncommunication|Sharing information.\ncommunity|A group of people in an area.\ncompany|A business.\ncompare|To look at similarities.\ncomparison|Looking at similarities.\ncompete|To try to win.\ncompetition|A contest.\ncompetitive|Wanting to win.\ncomplaint|An expression of unhappiness.\ncomplete|To finish; whole.\ncompletely|Fully.\ncomplexity|The state of being complex.\ncomplicate|To make difficult.\nconcentrate|To focus.\nconcentration|Focus.\nconcept|An idea.\nconcern|Worry; or to worry.\nconcerned|Worried.\nconclude|To end; to decide.\nconclusion|The end; a decision.\ncondition|A state; a requirement.\nconduct|To carry out; behavior.\nconference|A meeting.\nconfidence|Trust in oneself.\nconfident|Sure of oneself.\nconflict|A disagreement or fight.\nconfuse|To make unclear.\nconfused|Unable to think clearly.\nconfusion|Lack of clarity.\ncongress|A formal meeting; a law-making body.\nconnect|To join.\nconnection|A link.\nconsequence|A result.\nconservative|Resistant to change.\nconsider|To think about.\nconsiderable|Large; important.\nconsideration|Thought; care.\nconsist|To be made of.\nconstant|Always the same.\nconstruct|To build.\nconstruction|Building.\nconsult|To ask for advice.\nconsultant|A person who gives advice.\nconsume|To use up; to eat.\nconsumer|A person who buys.\ncontact|To get in touch.\ncontain|To hold inside.\ncontest|A competition.\ncontext|The situation around something.\ncontinuous|Without stopping.\ncontract|A written agreement.\ncontribute|To give or add.\ncontribution|Something given.\nconvenient|Easy to use or reach.\nconvention|A large meeting; a custom.\nconversation|A talk between people.\nconvert|To change into.\nconvince|To make believe.\ncook|To prepare food.\ncookie|A small sweet baked good.\ncooking|Preparing food.\ncool|A bit cold; good.\ncore|The center.\ncorner|Where two edges meet.\ncorporate|Related to a company.\ncorrect|Right; true.\ncost|The price; or to have a price.\ncould|Past of can.\ncouncil|A group that decides.\ncount|To add up; a nobleman.\ncountry|A nation.\ncounty|A division of a state.\ncouple|Two; a pair.\ncourse|A path; a class.\ncourt|Where trials happen.\ncover|To put over; a lid.\ncraft|Skill; or to make by hand.\ncrash|To hit and break.\ncrazy|Mad; very enthusiastic.\ncreation|Something created.\ncreative|Good at creating.\ncredit|Trust; or money lent.\ncrime|An illegal act.\ncriminal|Related to crime.\ncrisis|A dangerous situation.\ncriterion|A standard for judging.\ncritical|Very important; fault-finding.\ncriticism|Judgment or comment.\ncriticize|To find fault.\ncross|To go across.\ncrowd|A large group of people.\ncrucial|Very important.\ncry|To shed tears.\nculture|The arts and customs of a group.\ncup|A small container for drinks.\ncurious|Wanting to know.\ncurrency|Money in use.\ncurve|A bent line.\ncustomer|A person who buys.\ncycle|A repeated series.\ndad|Father.\ndaily|Every day.\ndamage|Harm; or to harm.\ndance|To move to music.\ndanger|Risk of harm.\ndangerous|Risky.\ndare|To be brave enough.\ndata|Facts or information.\ndate|A day; or to go out with.\ndaughter|A female child.\ndead|Not alive.\ndeal|An agreement; or to handle.\ndealer|A person who sells.\ndear|Loved; expensive.\ndeath|The end of life.\ndebate|A formal argument.\ndebt|Money owed.\ndecade|Ten years.\ndecide|To make a choice.\ndecision|A choice made.\ndeclare|To say formally.\ndecline|To refuse; to decrease.\ndeep|Far down.\ndeeply|Very much.\ndefeat|To beat.\ndefend|To protect.\ndefense|Protection.\ndefine|To state the meaning.\ndefinitely|Certainly.\ndegree|A level; a title from a university.\ndelay|To put off.\ndeliver|To bring to.\ndelivery|The act of delivering.\ndemand|To ask strongly.\ndemocracy|Rule by the people.\ndemocratic|Favoring democracy.\ndemonstrate|To show.\ndemonstration|A show or protest.\ndeny|To say no.\ndepartment|A division of an organization.\ndepend|To rely on.\ndependent|Relying on.\ndeposit|To put in; money put in.\ndepression|Sadness; economic slump.\ndepth|How deep.\ndesert|Dry land.\ndeserve|To be worthy of.\ndesign|To plan; a plan.\ndesigner|A person who designs.\ndesire|To want; a want.\ndesk|A table for work.\ndespite|In spite of.\ndestroy|To ruin.\ndestruction|Ruin.\ndetailed|With many details.\ndetermine|To decide.\ndetermined|Having decided.\ndevelop|To grow or create.\ndevelopment|Growth; new product.\ndevote|To give fully.\ndialog|A conversation.\ndie|To stop living.\ndiet|What one eats.\ndiffer|To be different.\ndifference|What is not the same.\ndifficulty|Trouble.\ndig|To break up ground.\ndigital|Using numbers; electronic.\ndimension|Size or aspect.\ndinner|The main evening meal.\ndirect|Straight; or to guide.\ndirection|The way to go.\ndirectly|In a direct way.\ndirector|A person who directs.\ndirty|Not clean.\ndisagree|To not agree.\ndisappear|To vanish.\ndisaster|A great misfortune.\ndiscipline|Training; punishment.\ndiscount|A reduction in price.\ndiscover|To find.\ndiscovery|Something found.\ndiscuss|To talk about.\ndiscussion|A talk about something.\ndisease|An illness.\ndish|A plate; a type of food.\ndismiss|To send away.\ndisorder|Lack of order.\ndisplay|To show.\ndistance|How far.\ndistant|Far away.\ndistinct|Clearly different.\ndistinction|A difference.\ndistinguish|To tell apart.\ndistribute|To give out.\ndistribution|Giving out.\ndistrict|An area.\ndivide|To split.\ndivision|A part; splitting.\ndivorce|End of a marriage.\ndo|To perform.\ndoctor|A medical professional.\ndog|A domestic animal.\ndollar|A unit of money.\ndomain|An area of control.\ndomestic|Of the home; within a country.\ndominant|Most important.\ndominate|To control.\ndoor|An opening in a wall.\ndouble|Twice as much.\ndoubt|Uncertainty.\ndraft|A first version.\ndrama|A play; excitement.\ndramatic|Like drama; sudden.\ndraw|To make a picture.\ndream|Thoughts while sleeping.\ndress|Clothing; or to put on clothes.\ndrink|To swallow liquid.\ndrive|To operate a vehicle.\ndriver|A person who drives.\ndrug|A medicine or illegal substance.\ndry|Not wet.\ndue|Owed; expected.\ndust|Fine dirt.\nduty|Something one must do.\neconomic|Related to money and trade.\neconomy|The system of money and trade.\nedge|The border or line where something ends.\neducation|Learning and teaching.\neffect|A result or impact.\neffective|Working well.\nefficiency|Doing something without waste.\nefficient|Using time and resources well.\neffort|Hard work or attempt.\negg|An oval object laid by birds.\nelection|A vote to choose a leader.\nelectric|Using electricity.\nelement|A basic part.\neliminate|To remove completely.\nelse|Other; different.\nembarrass|To make someone feel ashamed.\nemerge|To come out or appear.\nemergency|A sudden serious situation.\nemotion|A strong feeling.\nemphasis|Special importance.\nemploy|To give work to.\nemployee|A person who works for someone.\nemployer|A person who hires others.\nemployment|Having a job.\nempty|Containing nothing.\nencounter|To meet; or a meeting.\nencourage|To give hope or support.\nenergy|Power; vitality.\nengage|To take part; to hire.\nengine|A machine that provides power.\nengineer|A person who designs or builds.\nenhance|To improve.\nenjoy|To take pleasure in.\nenormous|Very large.\nenough|As much as needed.\nensure|To make sure.\nenterprise|A business or project.\nentertainment|Things that amuse.\nentire|Whole; complete.\nentitle|To give the right to.\nentry|A way in; something written.\nenvironment|Surroundings; the natural world.\nequal|The same in amount or value.\nequipment|Tools and machines.\nespecially|More than usual.\nessential|Very important; necessary.\nestablish|To set up.\nestate|Property; land.\nestimate|To guess; a rough calculation.\nevening|The time before night.\nevent|Something that happens.\neventually|In the end.\never|At any time.\neverybody|Every person.\nevidence|Proof or signs.\nevil|Very bad.\nexact|Precise.\nexactly|Precisely.\nexamination|A test or inspection.\nexamine|To look at closely.\nexcellent|Very good.\nexcept|Not including.\nexception|Something that does not follow the rule.\nexchange|To swap.\nexcite|To make eager.\nexcitement|Feeling of eagerness.\nexclude|To leave out.\nexcuse|A reason given.\nexecute|To carry out.\nexercise|Physical activity; or to do it.\nexpansion|Growth.\nexpect|To think something will happen.\nexpectation|What you expect.\nexpense|Cost; money spent.\nexpensive|Costing a lot.\nexperience|Knowledge from doing; or to have it.\nexperiment|A test to discover.\nexpert|A person with great skill.\nexplanation|Words that explain.\nexplore|To travel to discover.\nexpress|To show or say.\nexpression|A word or phrase; a look.\nextend|To make longer.\nextension|An addition.\nextent|How far; degree.\nexternal|On the outside.\nextra|More than usual.\nextract|To take out.\nextraordinary|Very unusual.\nextreme|Very great.\neye|The organ of sight.\nface|The front of the head.\nfact|Something that is true.\nfactor|Something that has an effect.\nfail|To not succeed.\nfailure|Lack of success.\nfair|Just; light in color.\nfaith|Trust; belief.\nfall|To drop down.\nfamiliar|Known.\nfamily|Parents and children.\nfamous|Known by many.\nfan|Someone who admires; a device for air.\nfarm|Land for growing crops.\nfarmer|A person who farms.\nfashion|Style of clothing.\nfat|Having too much flesh; or grease.\nfather|A male parent.\nfault|Responsibility for a mistake.\nfavor|Kindness; or to prefer.\nfavorite|Most liked.\nfear|To be afraid of.\nfee|Payment for a service.\nfeed|To give food to.\nfeedback|Comments about something.\nfeeling|An emotion.\nfemale|Of the female sex.\nfight|To struggle against.\nfigure|A number; a shape.\nfill|To make full.\nfilm|A movie.\nfinal|Last.\nfinally|At last.\nfinance|Money matters.\nfinancial|Related to money.\nfinding|Something discovered.\nfinger|One of five on the hand.\nfire|Burning; or to dismiss.\nfirm|Solid; a company.\nfish|An animal that lives in water.\nfit|Suitable; or to be the right size.\nfix|To repair.\nflat|Smooth and level.\nflexible|Able to bend.\nflight|A trip by plane.\nfloat|To stay on the surface.\nfloor|The ground; a level of a building.\nflow|To move smoothly.\nflower|A plant\'s bloom.\nfold|To bend over.\nfollow|To come after.\nfollowing|Next.\nfood|What you eat.\nfoot|The end of the leg.\nforce|Strength; or to make do.\nforeign|From another country.\nforest|A large area of trees.\nforever|For all time.\nformal|Official; proper.\nformer|Earlier.\nformula|A set method.\nforth|Forward.\nfortune|Luck; wealth.\nfound|To start; past of find.\nfoundation|The base.\nframe|A border or structure.\nfree|Not costing money; not confined.\nfreedom|The state of being free.\nfreeze|To turn to ice.\nfrequency|How often.\nfrequent|Happening often.\nfresh|New; not stale.\nfriend|A person you like.\nfriendly|Kind and welcoming.\nfriendship|Being friends.\nfront|The forward part.\nfruit|Food from plants.\nfuel|What makes engines run.\nfully|Completely.\nfunction|To work; a purpose.\nfund|Money set aside.\nfundamental|Basic.\nfunny|Causing laughter.\nfurniture|Tables\nfuture|Time to come.\ngain|To get.\ngame|An activity with rules.\ngap|A space or break.\ngarage|A place for cars.\ngarden|A place to grow plants.\ngas|A substance like air.\ngate|A barrier that opens.\ngather|To collect.\ngeneral|Overall; not specific.\ngenerally|Usually.\ngenerate|To produce.\ngeneration|People born around the same time.\ngenerous|Give freely.\ngentle|Soft; kind.\ngenuine|Real.\ngesture|A movement that expresses something.\nget|To obtain.\ngirl|A female child.\ngive|To hand over.\nglad|Happy.\nglass|A hard transparent material.\nglobal|Worldwide.\ngoal|An aim.\ngold|A yellow precious metal.\ngovernment|The ruling body.\ngrade|A level; a score.\ngrand|Imposing.\ngrant|To give; money given.\ngrass|Green plants on the ground.\ngreen|The color of grass.\nground|The surface of the earth.\ngrow|To get bigger.\ngrowth|The process of growing.\nguarantee|To promise.\nguard|To protect.\nguess|To estimate.\nguest|A person who is invited.\nguilty|Responsible for a wrong.\nhabit|Something you do often.\nhair|What grows on the head.\nhall|A corridor; a large room.\nhand|The part at the end of the arm.\nhandle|To deal with; a part to hold.\nhang|To attach from above.\nhappen|To occur.\nhappy|Pleased.\nhardly|Almost not.\nharm|To hurt.\nhead|The top of the body.\nhealth|Condition of the body.\nhealthy|In good health.\nhear|To perceive sound.\nheart|The organ that pumps blood.\nheat|Hotness.\nheavy|Weighing a lot.\nheight|How tall.\nhence|For this reason.\nhighly|Very.\nhill|A raised area of land.\nhire|To employ.\nhistory|Past events.\nhit|To strike.\nhold|To grasp.\nhole|An opening.\nholiday|A day off.\nhonest|Telling the truth.\nhope|To want and expect.\nhorizon|Where the sky meets the land.\nhospital|A place for medical care.\nhost|A person who receives guests.\nhot|Having high temperature.\nhotel|A place to stay when traveling.\nhour|60 minutes.\nhouse|A building to live in.\nhuge|Very large.\nhuman|A person.\nhundred|The number 100.\nhungry|Wanting food.\nhunt|To search for.\nhurry|To move quickly.\nhurt|To cause pain.\nhusband|A married man.\nidea|A thought.\nideal|Perfect.\nidentify|To recognize.\nidentity|Who you are.\nignore|To not pay attention to.\nill|Sick.\nillness|A disease.\nillustrate|To explain with pictures.\nimagine|To form a mental picture.\nimpact|An effect.\nimplement|To put into action.\nimplementation|Putting into action.\nimply|To suggest.\nimportance|Being important.\nimportant|Mattering a lot.\nimpose|To force.\nimpossible|Not possible.\nimpress|To make a strong effect.\nimpression|An effect or idea.\nimprove|To make better.\nimprovement|A change for the better.\ninch|A unit of length.\nincident|An event.\ninclude|To contain.\nincome|Money earned.\nincorporate|To include.\nincreasingly|More and more.\nindeed|In fact.\nindependence|Being independent.\nindependent|Not dependent.\nindex|A list of contents.\nindicate|To point out.\nindication|A sign.\nindividual|Single person.\nindustrial|Related to industry.\nindustry|Business and manufacturing.\ninevitable|Cannot be avoided.\ninfect|To pass on disease.\ninflation|Rise in prices.\ninfluence|To affect.\ninform|To tell.\ninitial|First.\ninitially|At first.\ninitiative|A first step.\ninjury|Harm to the body.\ninner|Inside.\ninnocent|Not guilty.\ninnovation|A new idea.\ninquiry|A question.\ninside|The inner part.\ninsight|Understanding.\ninsist|To demand.\ninspection|A close look.\ninspiration|Something that inspires.\ninstance|An example.\ninstead|In place of.\ninstruction|Teaching; a direction.\ninstrument|A tool or musical device.\ninsurance|Protection against loss.\nintention|What you plan.\ninterest|Curiosity; or money earned.\ninterested|Caring about.\ninteresting|Arousing curiosity.\ninternal|Inside.\ninternational|Between nations.\ninterpret|To explain the meaning.\ninterview|A meeting to assess.\nintroduce|To present.\nintroduction|A presentation.\ninvest|To put money in.\ninvestigate|To look into.\ninvestigation|A formal inquiry.\ninvestment|Money invested.\ninvite|To ask to come.\ninvolve|To include.\ninvolved|Complicated; included.\nissue|A topic; or to give out.\ncomplain|To say something is wrong.\ncomputer|An electronic machine.\nconsiderably|Much.\nconstantly|Always.\ncooperation|Working together.\ncope|To deal with.\ncurtain|Fabric over a window.\ndepress|To make sad.\ndisk|A round flat object.\ndozen|Twelve.\ndrawer|A sliding compartment.\ndump|To drop heavily.\near|Organ for hearing.\nearn|To get by working.\nearth|The planet.\neast|The direction of sunrise.\neastern|Of the east.\neat|To consume food.\neconomics|Study of economy.\nedition|A version.\neditor|One who edits.\neducate|To teach.\neffectively|In an effective way.\neither|One of two.\nelderly|Old.\nelect|To choose by vote.\nelectricity|A form of energy.\nelectronic|Using electronics.\nelsewhere|Somewhere else.\nemotional|Related to emotions.\nemphasize|To stress.\nencouragement|Support.\nengineering|The field of design.\nentirely|Completely.\nentrance|A way in.\nenvironmental|About the environment.\nepisode|One part of a series.\nequally|In equal way.\nequivalent|Equal in value.\nera|A period of time.\nessay|A short piece of writing.\nestablishment|Something established.\netc|And so on.\nethnic|Of a culture.\neuropean|Of Europe.\nevaluate|To assess.\nevaluation|Assessment.\neveryday|Daily.\nexam|A test.\nexcited|Thrilled.\nexciting|Thrilling.\nexecutive|A top manager.\nexist|To be.\nexistence|Being.\nexperienced|Having experience.\nextremely|Very.\nfacility|A building or equipment.\nfairly|Reasonably.\nfiction|Made-up story.\nflavor|Taste.\nfly|To move through air.\nfrequently|Often.\nfun|Enjoyment.\ngentleman|A man.\ngolf|A sport.\ngrandmother|Mother\'s mother.\ngrandfather|Father\'s father.\ngun|A weapon.\nguy|A man.\nhell|A bad place.\nhelpful|Giving help.\nhero|A brave person.\nhistorian|One who studies history.\nhistoric|Important in history.\nhistorical|Of history.\nhomework|School work at home.\nhousing|Homes.\nillegal|Against the law.\nimplication|What is suggested.\nincluding|Containing.\nincreased|Grown.\nincreasing|Growing.\ninformal|Not formal.\ninstitution|An organization.\ninstructor|Teacher.\nintelligence|Smarts.\nintense|Strong.\nintensity|Strength.\ninteraction|Communication.\ninterpretation|Explanation.\ninterrupt|To break in.\ninterval|A space.\ninvasion|An attack.\ninvestor|One who invests.\ninvolvement|Participation.\niron|A metal.\nisland|Land in water.\nit|That thing.\nits|Belonging to it.\nitself|It.\njacket|Outer garment.\njob|Work.\njoin|To connect.\njoint|Shared.\njoke|Something funny.\njournal|A diary.\njournalist|A reporter.\njourney|A trip.\njoy|Happiness.\njudge|To decide.\njudgment|A decision.\njuice|Liquid from fruit.\njump|To leap.\njunior|Younger.\njury|Decision makers.\njustice|Fairness.\njustify|To give reason.\nkeep|To hold.\nkick|To hit with foot.\nkid|A child.\nkill|To cause death.\nking|Male ruler.\nkiss|To touch with lips.\nkitchen|Room for cooking.\nknee|Joint in leg.\nknife|A blade.\nknock|To hit.\nknowledge|What is known.\nlab|Laboratory.\nlabor|Work.\nlaboratory|A lab.\nlack|To not have.\nlady|A woman.\nlake|Water body.\nland|Ground.\nlandscape|The view.\nlane|A path.\nlargely|Mostly.\nlaugh|To make sound of joy.\nlaw|A rule.\nlawyer|Legal advisor.\nlay|To put down.\nlayer|A level.\nlead|To guide.\nleader|One who leads.\nleadership|Leading.\nleading|Main.\nleague|A group.\nlean|To tilt.\nlearning|Gaining knowledge.\nlegal|Of the law.\nlegislation|Laws.\nlength|How long.\nlesson|Something taught.\nlet|To allow.\nlibrary|Place for books.\nlicense|Permission.\nlie|To say false.\nlife|Being alive.\nlifestyle|Way of living.\nlifetime|All of life.\nlift|To raise.\nlimit|A boundary.\nliterally|Actually.\nliterary|Of literature.\nliterature|Written works.\nlittle|Small.\nlive|To be alive.\nliving|Alive.\nloan|Money lent.\nlocal|Nearby.\nlocate|To find.\nlocation|A place.\nlock|To secure.\nlong|Not short.\nlook|To see.\nlose|To not win.\nloss|Losing.\nlost|Cannot find.\nlovely|Beautiful.\nlover|One who loves.\nluck|Chance.\nlucky|Having luck.\nlunch|Midday meal.\nmachine|A device.\nmad|Angry.\nmagazine|A periodical.\nmail|Post.\nmainly|Mostly.\nmaintain|To keep.\nmaintenance|Upkeep.\nmajor|Large.\nmajority|Most.\nmake|To create.\nmaker|One who makes.\nmale|Man or boy.\nmall|Shopping center.\nman|Adult male.\nmanage|To run.\nmanagement|Running.\nmanager|One who manages.\nmanner|Way.\nmanufacturing|Making goods.\nmap|A chart.\nmargin|Edge.\nmark|A sign.\nmarket|Place to buy.\nmarketing|Selling.\nmarriage|Being married.\nmarried|Wed.\nmarry|To wed.\nmass|Bulk.\nmassive|Huge.\nmaster|To learn fully.\nmatch|To fit.\nmaterial|Stuff.\nmath|Mathematics.\nmatter|Substance.\nmaximum|Most.\nmaybe|Perhaps.\nmeal|Food serving.\nmean|To intend.\nmeans|Method.\nmeanwhile|At the same time.\nmeasure|To find size.\nmeasurement|A size.\nmechanism|A system.\nmedia|News outlets.\nmedical|Of medicine.\nmedicine|Treatment.\nmedium|Middle.\nmeet|To encounter.\nmeeting|A gathering.\nmember|Part of group.\nmembership|Being a member.\nmemory|Recall.\nmental|Of the mind.\nmention|To refer to.\nmere|Only.\nmerely|Only.\nmethod|A way.\nmiddle|Center.\nmidnight|12 at night.\nmight|May.\nmilitary|Armed forces.\nmillion|1,000,000.\nmind|The brain.\nminimum|Least.\nminor|Small.\nminority|Smaller part.\nminute|60 seconds.\nmissing|Lost.\nmission|A task.\nmistake|An error.\nmix|To combine.\nmixture|A blend.\nmobile|Movable.\nmode|A way.\nmodel|A copy.\nmodern|Current.\nmoment|An instant.\nmoney|Currency.\nmoral|Good.\nmoreover|Besides.\nmorning|Early day.\nmortgage|Home loan.\nmostly|Mainly.\nmother|Female parent.\nmotor|Engine.\nmount|To climb.\nmouse|Small rodent.\nmouth|Opening for food.\nmove|To go.\nmovement|Motion.\nmovie|A film.\nmuch|A lot.\nmultiple|Many.\nmurder|Killing.\nmuscle|Body tissue.\nmuseum|Place for art.\nmusic|Sounds.\nmusical|Of music.\nmusician|One who plays music.\nmust|Have to.\nmutual|Shared.\nmyself|Me.\nmystery|Something unknown.\nnail|Finger tip.\nnarrative|A story.\nnation|A country.\nnational|Of a nation.\nnative|Original.\nnatural|Of nature.\nnaturally|By nature.\nnature|The world.\nnear|Close.\nnearby|Close by.\nnearly|Almost.\nnecessarily|Of necessity.\nnecessary|Needed.\nneck|Between head and body.\nnegative|Bad.\nnegotiate|To discuss.\nnegotiation|Discussion.\nneighbor|Person next door.\nneighborhood|Area.\nneither|Not either.\nnerve|Courage.\nnervous|Anxious.\nnetwork|A system.\nnevertheless|However.\nnews|Information.\nnewspaper|A paper.\nnice|Pleasant.\nnight|Dark time.\nnine|9.\nnobody|No person.\nnoise|Sound.\nnone|Not any.\nnor|And not.\nnormally|Usually.\nnorth|A direction.\nnorthern|Of north.\nnose|Smell organ.\nnot|Negative.\nnote|A short note.\nnotion|An idea.\nnovel|A book.\nnumerous|Many.\nnurse|Caregiver.\nobject|A thing.\nobjective|A goal.\nobligation|A duty.\nobservation|Watching.\nobserve|To watch.\nobtain|To get.\nobvious|Clear.\nobviously|Clearly.\noccasion|A time.\noccasionally|Sometimes.\noccur|To happen.\nocean|The sea.\nodd|Strange.\noffense|Crime.\noffer|To give.\noffice|Workplace.\nofficer|Official.\nofficial|Formal.\noil|Liquid fat.\nokay|Alright.\nolympic|Of Olympics.\none|1.\nongoing|Continuing.\nonline|On the internet.\nopening|A start.\noperate|To work.\noperation|Surgery; action.\noperator|One who operates.\nopinion|A view.\nopponent|Rival.\nopportunity|A chance.\noppose|To be against.\nopposite|Reverse.\nopposition|Against.\nor|Either.\norange|A color.\nordinary|Normal.\norganic|Natural.\norganization|A group.\norganize|To arrange.\norientation|Direction.\norigin|Start.\noriginal|First.\noriginally|At first.\nothers|Other people.\notherwise|Or else.\nought|Should.\nours|Belonging to us.\nourselves|Us.\noutcome|Result.\noutline|A summary.\noutside|External.\noverall|Total.\novercome|To defeat.\nowe|To be in debt.\nowner|One who owns.\npace|Speed.\npack|To fill.\npackage|A parcel.\npain|Hurt.\npaint|To color.\npainting|A picture.\npair|Two.\npanel|A group.\npants|Trousers.\npaper|Sheet material.\nparent|Mother or father.\npark|Green space.\nparking|Place to leave car.\nparticipant|One who takes part.\nparticipate|To take part.\nparticipation|Taking part.\nparticular|Specific.\nparticularly|Especially.\npartly|In part.\npartner|A mate.\npartnership|Being partners.\nparty|A celebration.\npass|To go by.\npassage|A path.\npassenger|Rider.\npassion|Strong feeling.\npast|Before now.\npath|A way.\npatient|Sick person.\npattern|A design.\npause|To stop briefly.\npay|To give money.\npayment|Money paid.\npeace|Calm.\npeak|Top.\npeer|Equal.\npen|Writing tool.\npenalty|Punishment.\npercentage|A part.\nperfect|Flawless.\nperfectly|Completely.\nperform|To do.\nperformance|How one does.\nperhaps|Maybe.\nperiod|A time.\npermanent|Lasting.\npermit|To allow.\npersonal|Private.\npersonality|Character.\npersonally|In person.\npersonnel|Staff.\nperspective|Viewpoint.\nphase|A stage.\nphenomenon|An occurrence.\nphone|Telephone.\nphoto|Picture.\nphotograph|A photo.\nphrase|A group of words.\nphysical|Of the body.\nphysically|In body.\npicture|An image.\npile|A stack.\npilot|One who flies.\npin|A fastener.\npink|A color.\npipe|A tube.\nplan|A scheme.\nplane|Airplane.\nplanet|A world.\nplanning|Making plans.\nplant|A growing thing.\nplastic|A material.\nplate|A dish.\nplatform|A stage.\nplayer|One who plays.\npleasure|Enjoyment.\nplenty|Enough.\nplus|And.\npocket|A pouch.\npoem|Verse.\npoet|Writer of verse.\npoetry|Verse.\npole|A rod.\npolicy|A rule.\npolitical|Of politics.\npolitician|Office holder.\npolitics|Government.\npoll|A survey.\npool|Water hole.\npoor|Not rich.\npop|Popular.\npopular|Liked.\npopulation|People.\nport|Harbor.\npositive|Good.\npossess|To have.\npossibility|A chance.\npossible|Able to be.\npossibly|Perhaps.\npost|To mail.\npotential|Possible.\npotentially|Maybe.\npound|Weight unit.\npour|To flow.\npoverty|Being poor.\npower|Strength.\npowerful|Strong.\npractical|Useful.\npractice|To do often.\npray|To ask God.\nprefer|To like more.\npregnancy|Being pregnant.\npregnant|With child.\npreparation|Getting ready.\nprepare|To get ready.\npresence|Being there.\npresent|Here now.\npresentation|A show.\npreserve|To keep.\npresident|Leader.\npress|To push.\npressure|Force.\npretend|To fake.\npretty|Nice looking.\nprevent|To stop.\npreviously|Before.\nprice|Cost.\nprimary|First.\nprime|Best.\nprincipal|Main.\nprinciple|A rule.\nprior|Before.\npriority|Importance.\nprivate|Personal.\nprobably|Likely.\nproblem|A difficulty.\nprocedure|A process.\nproceed|To go on.\nprocess|A method.\nproduce|To make.\nproducer|One who makes.\nproduct|Something made.\nproduction|Making.\nprofessional|Pro.\nprofessor|Teacher.\nprofit|Gain.\nprogram|A plan.\nprogress|Advance.\nproject|A plan.\npromise|To pledge.\npromote|To advance.\npromotion|Advancement.\nprompt|Quick.\nproof|Evidence.\nproper|Correct.\nproperly|Correctly.\nproperty|Ownership.\nproposal|A plan.\npropose|To suggest.\nproposed|Suggested.\nprotect|To guard.\nprotection|Guard.\nprove|To show true.\nprovide|To give.\nprovider|One who gives.\nprovince|A region.\nprovision|Supply.\npsychological|Of the mind.\npsychology|Study of mind.\npublic|Open.\npublication|Publishing.\npublish|To issue.\npull|To drag.\npurchase|To buy.\npure|Clean.\npurpose|Aim.\npursue|To chase.\npush|To shove.\nput|To place.\nqualify|To meet standards.\nquality|Grade.\nquarterback|Football position.\nquestion|An inquiry.\nquickly|Rapidly.\nquiet|Silent.\nquietly|Silently.\nquit|To stop.\nquite|Very.\nquote|To cite.\nrace|A contest.\nrain|Precipitation.\nraise|To lift.\nrange|Extent.\nrank|Position.\nrapid|Fast.\nrapidly|Quickly.\nrare|Uncommon.\nrarely|Seldom.\nrather|Instead.\nratio|Proportion.\nraw|Uncooked.\nreach|To get to.\nreact|To respond.\nreaction|Response.\nreading|Looking at text.\nready|Prepared.\nreal|Actual.\nreality|What is real.\nrealize|To understand.\nreally|Truly.\nreason|A cause.\nreasonable|Fair.\nreasonably|Fairly.\nrecall|To remember.\nrecent|Lately.\nrecently|Lately.\nrecognition|Acknowledgment.\nrecognize|To know.\nrecommend|To suggest.\nrecommendation|A suggestion.\nrecord|To write down.\nrecover|To get better.\nrecovery|Getting better.\nreference|A mention.\nreflect|To think.\nreflection|Thought.\nreform|To improve.\nrefuse|To say no.\nregard|To consider.\nregarding|About.\nregion|An area.\nregional|Of a region.\nregister|To sign up.\nregular|Usual.\nregularly|Often.\nregulation|A rule.\nreinforce|To strengthen.\nreject|To refuse.\nrelate|To connect.\nrelation|Connection.\nrelationship|Connection.\nrelative|Family.\nrelatively|Quite.\nrelax|To rest.\nrelease|To let go.\nrelevant|Related.\nreliable|Trustworthy.\nrelief|Ease.\nreligion|Faith.\nreligious|Of religion.\nrely|To depend.\nremain|To stay.\nremaining|Left.\nremarkable|Notable.\nremind|To cause to remember.\nremote|Far.\nrepeat|To do again.\nrepeatedly|Again and again.\nreplace|To substitute.\nreport|To tell.\nreporter|One who reports.\nrepresent|To stand for.\nrepresentation|Standing for.\nrepresentative|Agent.\nreputation|Standing.\nrequest|To ask.\nrequire|To need.\nrequirement|A need.\nresearch|Study.\nresearcher|One who researches.\nreserve|To save.\nresident|One who lives.\nresist|To oppose.\nresolution|Decision.\nresolve|To decide.\nresort|To turn to.\nresource|Supply.\nrespect|Esteem.\nrespond|To reply.\nresponse|A reply.\nresponsibility|Duty.\nresponsible|Accountable.\nrest|To relax.\nrestaurant|Place to eat.\nrestrict|To limit.\nretain|To keep.\nretire|To stop working.\nretirement|After work.\nreveal|To show.\nrevenue|Income.\nreview|To look at.\nrevolution|Overthrow.\nreward|Prize.\nrice|A grain.\nrich|Wealthy.\nrid|Free of.\nride|To travel.\nring|A circle.\nrise|To go up.\nrisk|Danger.\nriver|Water flow.\nroad|A street.\nrock|Stone.\nrole|A part.\nroll|To turn.\nromantic|Loving.\nroom|A space.\nroot|Base of plant.\nrope|Cord.\nrough|Not smooth.\nround|Circular.\nroute|A path.\nroutine|Habit.\nrow|A line.\nrule|A law.\nrun|To move fast.\nrural|Country.\nrush|To hurry.\nsafe|Secure.\nsafety|Security.\nsale|Selling.\nsalt|Seasoning.\nsample|A specimen.\nsand|Tiny stones.\nsatellite|Orbiter.\nsatisfaction|Contentment.\nsatisfy|To please.\nscale|A range.\nscene|A view.\nschedule|A plan.\nscheme|A plan.\nscholar|Learned person.\nscholarship|Award.\nschool|Place to learn.';
-    var localDict = (function(){ var o={}; var parts = LOCAL_DICT_STR.split('\n'); for (var i=0;i<parts.length;i++){ var p = parts[i].indexOf('|'); if (p>0) { var w = parts[i].slice(0,p); var d = parts[i].slice(p+1).replace(/\\p/g,'|').replace(/\\\\/g,'\\'); o[w]=d; } } return o; })();
-    function getLocalDefinition(word) { var w = word.toLowerCase().replace(/[^a-z]/g,''); return localDict[w] || null; }
-
+    // Fallback when no API: return definition from small built-in word list, or null.
+    function getLocalDefinition(word) {
+      var w = word.toLowerCase().replace(/[^a-z]/g, '');
+      var local = { accessibility: 'Making something usable by people with disabilities.', contrast: 'Difference in brightness between text and background.', dyslexia: 'A condition that can make reading and spelling harder.', read: 'To look at and understand written text.', text: 'Written or printed words.', font: 'A set of letters and symbols in one style.', size: 'How big or small something is.', page: 'A single side of a sheet of paper or a web document.', link: 'A clickable connection to another page or resource.', button: 'A control you click to perform an action.', help: 'Support or assistance.', more: 'Additional.', the: 'Used to refer to something already mentioned.', and: 'Connects words or phrases.' };
+      return local[w] || null;
+    }
   
     // --- Tooltip: short-lived popup (e.g. link URL on focus, export/import messages) ---
+    // Show a temporary tooltip near element `near` (or top-left) with `text`; auto-remove after 6s.
     function showTooltip(near, text) {
       const id = 'oa-tooltip-' + Date.now();
       const tip = document.createElement('div');
@@ -1372,8 +2689,10 @@
     }
   
     // --- Dictionary modal audio: server TTS if apiBase, else browser SpeechSynthesis ---
+    // Speak text in word modal (word or definition); respects mute; calls done() when finished.
     function speakTextForModal(text, done) {
       if (!text || !text.trim()) { if (done) done(); return; }
+      if (isTtsMuted()) { if (done) done(); return; }
       var t = text.trim().slice(0, 3000);
       if (apiBase) {
         requestServerTts(t, function (url) {
@@ -1390,25 +2709,21 @@
       }
       speakTextForModalBrowser(t, done);
     }
+    // Speak text via SpeechSynthesis using widget rate/pitch/voice; used when no server TTS.
     function speakTextForModalBrowser(t, done) {
       if (!global.speechSynthesis) { if (done) done(); return; }
       // Use widget rate/pitch/voice for consistency
       global.speechSynthesis.cancel();
       var u = new SpeechSynthesisUtterance(t);
-      u.rate = state.ttsRate || 1;
-      u.pitch = state.ttsPitch || 1;
-      u.lang = state.language || document.documentElement.lang || 'en';
-      if (state.ttsVoice && global.speechSynthesis.getVoices) {
-        var v = global.speechSynthesis.getVoices().find(function (x) { return x.name === state.ttsVoice; });
-        if (v) u.voice = v;
-      }
+      applyTtsOptionsToUtterance(u);
       u.onend = u.onerror = function () { if (done) done(); };
       global.speechSynthesis.speak(u);
       emit('tts:start', {});
     }
   
-    // --- Dictionary modal: word + definition + optional pronunciation, Play word / Play definition buttons ---
-    function showWordModal(word, definition, pronunciation) {
+    // --- Dictionary modal: word + definition text, Play word / Play definition buttons, close on Escape or backdrop ---
+    // Open modal showing word and definition with Play word / Play definition buttons; focus close button.
+    function showWordModal(word, definition) {
       var prev = document.getElementById('oa-word-modal-root');
       if (prev) prev.remove();
       var root = document.createElement('div');
@@ -1419,15 +2734,12 @@
       root.setAttribute('aria-labelledby', 'oa-word-modal-title');
       var modal = document.createElement('div');
       modal.className = 'oa-word-modal';
-      var wordDisplay = (word && String(word).trim()) ? escapeHtml(String(word).trim()) : 'â€”';
+      var wordDisplay = (word && String(word).trim()) ? escapeHtml(String(word).trim()) : '—';
       var defDisplay = (definition && String(definition).trim()) ? escapeHtml(String(definition).trim()) : 'No definition available.';
-      var pronText = (pronunciation && String(pronunciation).trim()) ? escapeHtml(String(pronunciation).trim()) : '\u2014';
-      var pronDisplay = '<p class="oa-pron-label">Pronunciation</p><p class="oa-word-pron">' + pronText + '</p>';
       modal.innerHTML =
         '<button type="button" class="oa-close-modal" aria-label="Close">\u00D7</button>' +
         '<p class="oa-word-label">Word</p>' +
         '<h2 id="oa-word-modal-title">' + wordDisplay + '</h2>' +
-        pronDisplay +
         '<p class="oa-def-label">Definition</p>' +
         '<p class="oa-word-def">' + defDisplay + '</p>' +
         '<div class="oa-word-audio">' +
@@ -1467,6 +2779,7 @@
     }
   
     // --- Focus strip: dimmed overlay so only a band of content is visible ---
+    // Create and append the focus-strip overlay when state.focusStrip is true.
     function ensureFocusStripMask() {
       if (document.getElementById('openaccessible-focus-strip')) return;
       const el = document.createElement('div');
@@ -1476,12 +2789,14 @@
       document.body.appendChild(el);
     }
   
+    // Remove the focus-strip overlay.
     function removeFocusStripMask() {
       const el = document.getElementById('openaccessible-focus-strip');
       if (el) el.remove();
     }
   
     // --- Reading guide: CSS var --oa-guide-y follows scroll for highlight band ---
+    // Listen to scroll and update --oa-guide-y so the reading-guide band follows the viewport. 
     function initReadingGuide() {
       document.addEventListener('scroll', function () {
         if (!state.readingGuide) return;
@@ -1490,6 +2805,7 @@
     }
   
     // --- Skip link and main landmark for screen reader users ---
+    // Add "Skip to main content" link and ensure main landmark exists when screenReaderHints is on. 
     function injectSkipLink() {
       if (!state.screenReaderHints) return;
       let skip = document.getElementById('openaccessible-skip');
@@ -1514,6 +2830,7 @@
     }
   
     // --- Load or save preferences from/to API (preferences_load / preferences_save) ---
+    // Call API to load or save user preferences; on load, merge into state and apply. 
     function syncApiPreferences(action) {
       if (!apiBase) return;
       const q = new URLSearchParams();
@@ -1536,12 +2853,62 @@
         .catch(() => {});
     }
   
+    /**
+     * @typedef {Object} OpenAccessibleAPI
+     * @property {function():Object} getState - Returns a copy of current state.
+     * @property {function(Object)} setState - Merge object into state, apply to document, persist.
+     * @property {function()} openPanel - Open the accessibility panel.
+     * @property {function()} closePanel - Close the panel.
+     * @property {function()} reset - Reset all settings to defaults.
+     * @property {function()} stopTTS - Stop any playing TTS.
+     * @property {function():Array} getPresets - Return user-saved presets.
+     * @property {function():Array} getBuiltinPresets - Return built-in preset id/name list.
+     * @property {function(string)} applyPreset - Apply preset by id or name.
+     * @property {function(string):string|null} saveCurrentAsPreset - Save current state as named preset; returns preset id or null.
+     * @property {function(string)} deletePreset - Delete user preset by id.
+     * @property {function()} showKeyboardShortcuts - Show keyboard shortcuts dialog.
+     * @property {function()} showAbout - Show about dialog.
+     * @property {function(string,string,function)} translate - Request translation; callback receives translated text or null.
+     * @property {function(Element=):Array} getHeadingsSummary - Return headings in root.
+     * @property {function(Element=):Array} getImagesWithoutAlt - Return images with alt status.
+     * @property {function(Element=):Array} getFormFieldsWithoutLabels - Return form controls without labels.
+     * @property {function(Element=):Object} getAccessibilitySummary - Return counts (headings, images missing alt, etc.).
+     * @property {function():Object} getSuggestedSettings - Return suggested overrides from system prefs.
+     * @property {function():Object} getDefaultStateSnapshot - Return default state object.
+     * @property {string} version - Widget version string.
+     * @property {Object} events - Map of event names to descriptions.
+     */
+
+    // --- Config options reference (for OpenAccessibleConfig / init(opts)) ---
+    /**
+     * Supported init options:
+     * - apiBase (string): Base URL for backend API (e.g. https://yoursite.com/api/). Used for action=translate, dictionary, preferences_load/save, tts.
+     * - apiUrl (string): Alias for apiBase.
+     * - apiKey (string): Optional API key sent as X-API-Key header.
+     * - userId (string): Optional user identifier for synced preferences.
+     * - useServerTts (boolean): If true, TTS requests go to apiBase?action=tts instead of browser SpeechSynthesis.
+     * - translateApiUrl (string): LibreTranslate-style translate endpoint. Default: OSS Translate URL. Set '' to use only apiBase and MyMemory.
+     * - iconUrl (string): URL for toolbar icon (default: from script path or inline SVG).
+     * - accountVerifyUrl (string): URL for account verification (footer badge).
+     * - root (string|Element): Scope for applying styles (selector or element); default document.documentElement.
+     */
+
     // --- Public init: opts.apiBase, opts.apiKey, opts.useServerTts, opts.accountVerifyUrl, etc. ---
+    // Initialize widget: load storage, inject styles, create toolbar and panel, attach listeners. Returns API object.
     function init(opts) {
       opts = opts || {};
-      apiBase = opts.apiBase || opts.apiUrl || '';
-      apiKey = opts.apiKey || '';
-      apiUserId = opts.userId || opts.user_id || '';
+      var normalized = normalizeInitOptions(opts);
+      apiBase = normalized.apiBase || '';
+      apiKey = normalized.apiKey || '';
+      apiUserId = normalized.userId || '';
+      if (normalized.translateApiUrl !== undefined) translateApiUrl = normalized.translateApiUrl;
+      iconUrl = normalized.iconUrl || getScriptBase() + 'icon.svg';
+      if (normalized.accountVerifyUrl) accountVerifyUrl = normalized.accountVerifyUrl;
+      if (normalized.root !== undefined) {
+        if (typeof normalized.root === 'string') $root = document.querySelector(normalized.root) || document.documentElement;
+        else if (normalized.root && normalized.root.nodeType === 1) $root = normalized.root;
+      }
+      useServerTts = !!normalized.useServerTts;
       useServerTts = !!opts.useServerTts;
       iconUrl = opts.iconUrl || (getScriptBase() + 'icon.svg');
       if (opts.accountVerifyUrl !== undefined) accountVerifyUrl = opts.accountVerifyUrl;
@@ -1551,7 +2918,7 @@
       if (apiBase) syncApiPreferences('load');
       injectStyles();
       applyToDocument();
-      if (state.dyslexiaFont) ensureFontsInjected();
+      if (state.dyslexiaFont) loadDyslexiaFont();
       createToolbar();
       createPanel();
       document.getElementById('openaccessible-panel').style.display = 'none';
@@ -1559,6 +2926,7 @@
       initDictionary();
       initReadingGuide();
       injectSkipLink();
+      ensureVoiceNavigation();
       document.body.addEventListener('click', function (e) {
         const t = e.target;
         if (t && t.closest && t.closest('#openaccessible-toolbar')) return;
@@ -1579,6 +2947,7 @@
           } else if (!text) hideSelectionBar();
         }, 10);
       });
+      // Global keyboard: Escape closes panel/overlays; Alt+A (Windows) or Option+A (Mac) toggles panel
       global.addEventListener('keydown', function (e) {
         if (e.key === 'Escape') { togglePanel(false); closeReadingView(); hideSelectionBar(); return; }
         if ((e.altKey || e.metaKey) && e.key.toLowerCase() === 'a') {
@@ -1591,7 +2960,31 @@
         }
       });
       emit('ready', { state, version: WIDGET_VERSION });
-      return { getState: () => ({ ...state }), setState: (s) => { state = { ...state, ...s }; applyToDocument(); writeStorage(); }, openPanel: () => togglePanel(true), closePanel: () => togglePanel(false), reset, stopTTS };
+      return {
+        getState: function () { return { ...state }; },
+        setState: function (s) { state = { ...state, ...s }; applyToDocument(); writeStorage(); },
+        openPanel: function () { togglePanel(true); },
+        closePanel: function () { togglePanel(false); },
+        reset: reset,
+        stopTTS: stopTTS,
+        getPresets: getSavedPresets,
+        getBuiltinPresets: function () { return Object.keys(BUILTIN_PRESETS).map(function (id) { return { id: id, name: BUILTIN_PRESETS[id].name }; }); },
+        applyPreset: applyPreset,
+        saveCurrentAsPreset: saveCurrentAsPreset,
+        deletePreset: deletePreset,
+        showKeyboardShortcuts: showKeyboardShortcuts,
+        showAbout: showAbout,
+        translate: function (text, targetLang, done) { requestTranslate(text, targetLang, done || function () {}); },
+        getHeadingsSummary: getHeadingsSummary,
+        getImagesWithoutAlt: getImagesWithoutAlt,
+        getFormFieldsWithoutLabels: getFormFieldsWithoutLabels,
+        getAccessibilitySummary: getAccessibilitySummary,
+        getSuggestedSettings: getSuggestedSettings,
+        getDefaultStateSnapshot: getDefaultStateSnapshot,
+        getVersionInfo: getVersionInfo,
+        version: WIDGET_VERSION,
+        events: WIDGET_EVENTS,
+      };
     }
   
     // --- Auto-init on load: use OpenAccessibleConfig if set, else init({}) ---
@@ -1604,7 +2997,7 @@
       if (global.OpenAccessibleConfig) init(global.OpenAccessibleConfig);
       else init({});
     }
-    
+  
     global.OpenAccessible = { init, version: WIDGET_VERSION };
   })(typeof window !== 'undefined' ? window : this);
   
