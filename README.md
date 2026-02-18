@@ -62,13 +62,14 @@ window.OpenAccessibleConfig = {
 
 ## Keyboard shortcuts
 
-| Shortcut | Action |
-|----------|--------|
-| **Alt+A** (Win) / **Option+A** (Mac) | Open or close panel |
-| **Escape** | Close panel or overlay |
-| **R** (in panel) | Read page |
-| **S** (in panel) | Stop reading |
-| **Tab** / **Shift+Tab** | Move focus in panel |
+
+| Action | Windows | Mac |
+|--------|---------|-----|
+| Open or close panel | **Alt+A** | **Option+A** |
+| Close panel or overlay | **Escape** | **Escape** |
+| Read page (in panel) | **R** | **R** |
+| Stop reading (in panel) | **S** | **S** |
+| Move focus in panel | **Tab** / **Shift+Tab** | **Tab** / **Shift+Tab** |
 
 ---
 
