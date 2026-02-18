@@ -69,7 +69,7 @@ window.OpenAccessibleConfig = {
 | Close panel or overlay | **Escape** | **<kbd>⎋ Escape</kbd>** |
 | Read page (in panel) | **R** | **<kbd>R</kbd>** |
 | Stop reading (in panel) | **S** | **<kbd>S</kbd>** |
-| Move focus in panel | **Tab** or **Shift+Tab** | **<kbd>⇥ Tab</kbd>** or **<kbd>⇧ Shift</kbd> + <kbd>⇥ Tab</kbd>** |
+| Move focus in panel | **Tab** **or** **Shift+Tab** | **<kbd>⇥ Tab</kbd>** **or** **<kbd>⇧ Shift</kbd> + <kbd>⇥ Tab</kbd>** |
 
 ---
 
