@@ -2,6 +2,9 @@
 
 **One embed. Open source.** A single-file accessibility widget for WCAG 2.2 AA: text-to-speech, contrast, translation, dyslexia font, and 30+ tools. No backend required—works offline with browser APIs and local storage.
 
+**Translation Api
+The Translation api is hosted on Elestio.
+
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://opensource.org/licenses/AGPL-3.0)
 
 ---
