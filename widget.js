@@ -2274,11 +2274,11 @@
       const trimmed = raw.trim();
       if (!trimmed || /\s/.test(trimmed)) return "";
       const w = trimmed
-        .replace(/^[\s"'â€œâ€â€˜â€™,.;:!?()[\]{}â€“â€”\-]+/, "")
-        .replace(/[\s"'â€œâ€â€˜â€™,.;:!?()[\]{}â€“â€”\-]+$/, "")
+        .replace(/^[\s"'\u201C\u201D\u2018\u2019,.;:!?()[\]{}-\u2013\u2014]+/u, "")
+        .replace(/[\s"'\u201C\u201D\u2018\u2019,.;:!?()[\]{}-\u2013\u2014]+$/u, "")
         .trim();
       if (!w || w.length > 120) return "";
-      if (!/^[A-Za-zÃ€-Ã¿]+(?:[-'][A-Za-zÃ€-Ã¿]+)*$/i.test(w)) return "";
+      if (!/^[A-Za-z\u00C0-\u00FF]+(?:[-'][A-Za-z\u00C0-\u00FF]+)*$/i.test(w)) return "";
       return w;
     }
   
@@ -3038,7 +3038,7 @@
         alert("Select text on the page first.");
         return;
       }
-      const m = s.match(/[A-Za-zÃ€-Ã¿0-9'-]+/);
+      const m = s.match(/[A-Za-z\u00C0-\u00FF0-9'-]+/);
       dictWordInput.value = (m ? m[0] : s.split(/\s+/)[0] || s).slice(0, 240);
       void runDictionaryLookup();
     });
