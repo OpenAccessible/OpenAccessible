@@ -2,7 +2,7 @@
 
 **OpenAccessible** is a free and open-source accessibility toolkit designed to make the web more inclusive, customizable, and easier to navigate for everyone. Our mission is to help website owners, developers, and organizations create better digital experiences for people with visual, motor, cognitive, and reading differences, while making accessibility tools simple to implement and maintain.
 
-Built with simplicity, performance, and user privacy in mind, OpenAccessible provides a lightweight, **single-file JavaScript accessibility widget** (`script.js`) that can be integrated into virtually any website. With just a small script, website owners can offer visitors a collection of accessibility and personalization tools without requiring complex installations, additional frameworks, or a dedicated backend.
+Built with simplicity, performance, and user privacy in mind, OpenAccessible provides a lightweight, **single-file JavaScript accessibility widget** (`widget.js`) that can be integrated into virtually any website. With just a small script, website owners can offer visitors a collection of accessibility and personalization tools without requiring complex installations, additional frameworks, or a dedicated backend.
 
 The widget runs directly in the visitor's browser, allowing users to personalize their browsing experience according to their individual needs and preferences. From adjusting text sizes and improving color contrast to reducing animations, enhancing readability, and supporting alternative navigation methods, OpenAccessible helps remove common barriers that can make websites difficult to use.
 
